@@ -33,19 +33,32 @@ def build_parts_context():
     if not data:
         return "ERROR: Could not load data from Google Sheets."
 
-    # На скриншоте видно, что заголовки (10x18, 10x20...) находятся на 3-й строке листа.
-    # В списках Python это индекс 2.
-    if len(data) < 3:
-        return "ERROR: Table has too few rows to parse headers."
+    headers = []
+    header_row_idx = 2  # По умолчанию берем 3-ю строку (индекс 2)
+    
+    # Умный поиск: проверяем строки 3, 2 и 1, чтобы найти ту, где есть размеры с буквой 'x'
+    for idx in [2, 1, 0]:
+        if len(data) > idx:
+            row_check = [cell.strip() for cell in data[idx] if cell.strip()]
+            if any('x' in c.lower() for c in row_check):
+                headers = [cell.strip() for cell in data[idx]]
+                header_row_idx = idx
+                break
+                
+    # Если автопоиск вдруг не сработал, жестко берем 3-ю строку
+    if not headers:
+        headers = [cell.strip() for cell in data[2]] if len(data) > 2 else []
 
-    headers = [cell.strip() for cell in data[2]]
+    # Выводим в логи Railway, что именно прочитал бот в шапке таблицы
+    logger.info(f"DEBUG HEADERS FOUND: {headers}")
     
     table_text = "STRUCTURE OF THE TABLE:\n"
     table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
     table_text += "DATA:\n"
     
-    # Данные начинаются с 4-й строки таблицы (в Python это индекс 3)
-    for row in data[3:]:
+    # Данные начинаются строго со следующей строки после найденных заголовков
+    start_row = header_row_idx + 1
+    for row in data[start_row:]:
         if len(row) < 2:
             continue
             
@@ -59,9 +72,14 @@ def build_parts_context():
         # Склеиваем колонку А и Б для получения уникального и точного названия детали
         full_name = f"{category} {sub_item}".strip()
         
-        # Собираем все ячейки с количеством, начиная с колонки C (индекс 2 и далее)
-        remaining_cells = [cell.strip() if cell else "" for cell in row[2:]]
-        
+        # Передаем ячейки количества, строго выравнивая их по длине заголовков шапки
+        remaining_cells = []
+        for i in range(2, len(headers)):
+            if i < len(row):
+                remaining_cells.append(row[i].strip())
+            else:
+                remaining_cells.append("")
+                
         # Записываем строку в формате понятного текстового CSV
         table_text += f"{full_name} | " + " | ".join(remaining_cells) + "\n"
         
@@ -111,18 +129,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": f"[{user_name}, {current_time}]: {message_text}"
     })
 
-    # Ограничиваем историю диалога (последние 10 сообщений), чтобы не перегружать память
+    # Ограничиваем историю диалога (последние 10 сообщений) для экономии контекста
     if len(user_conversations[user_id]) > 10:
         user_conversations[user_id] = user_conversations[user_id][-10:]
 
-    # Подгружаем свежую матрицу данных из таблицы при каждом запросе
+    # Динамически подгружаем свежую матрицу данных из таблицы при каждом запросе
     parts_data = build_parts_context()
     system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
     system_instruction += f"\n\nCurrent date/time inside the shop: {current_date}, {current_time}. Always respond in English."
 
     try:
         response = claude.messages.create(
-            model="claude-3-5-sonnet-latest", # Стабильная актуальная модель 
+            model="claude-3-5-sonnet-latest", 
             max_tokens=1200,
             system=system_instruction,
             messages=user_conversations[user_id]
