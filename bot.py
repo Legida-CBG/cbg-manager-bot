@@ -40,9 +40,9 @@ def build_parts_context():
     if not data:
         return "Could not load parts data from Google Sheets."
 
-    headers = data[0]  # First row with column names
+    headers = data[0]
 
-    # Find columns that contain greenhouse sizes (they have "x" in the name, e.g. 10x18)
+    # Find columns that contain greenhouse sizes (they have "x" in the name)
     size_columns = []
     for i, header in enumerate(headers):
         if header and 'x' in header.lower():
@@ -58,7 +58,7 @@ def build_parts_context():
     context += "Parts per greenhouse size (Item | Code | Size: Quantity):\n"
 
     for row in data[1:]:
-        if not row or not row[0]:  # Skip empty rows
+        if not row or not row[0]:
             continue
 
         item = row[0].strip()
@@ -71,7 +71,7 @@ def build_parts_context():
         for col_index, size_name in size_columns:
             if col_index < len(row):
                 qty = row[col_index].strip()
-                if qty:  # Only include if quantity is not empty
+                if qty:
                     quantities.append(f"{size_name}: {qty}")
 
         if quantities:
@@ -115,21 +115,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Message from {user_name}: {message_text}")
 
-    # Initialize conversation history
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
-    # Add user message to history
     user_conversations[user_id].append({
         "role": "user",
         "content": f"[{user_name}, {current_time}]: {message_text}"
     })
 
-    # Keep only last 20 messages to manage context
     if len(user_conversations[user_id]) > 20:
         user_conversations[user_id] = user_conversations[user_id][-20:]
 
-    # Load parts data
     parts_context = build_parts_context()
     system = SYSTEM_PROMPT.format(parts_context=parts_context)
     system += f"\n\nCurrent date and time: {current_date}, {current_time}"
@@ -144,7 +140,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = response.content[0].text
 
-        # Add assistant response to history
         user_conversations[user_id].append({
             "role": "assistant",
             "content": reply
