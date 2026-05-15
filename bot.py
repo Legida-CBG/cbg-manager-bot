@@ -10,6 +10,7 @@ import gspread
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Используем актуальное название модели
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 def get_parts_data():
@@ -19,6 +20,7 @@ def get_parts_data():
         gc = gspread.service_account_from_dict(creds_dict)
         spreadsheet = gc.open("Cedar-Built")
         sheet = spreadsheet.worksheet("Лист1")
+        # Получаем все данные как список списков
         data = sheet.get_all_values()
         logger.info(f"SUCCESS: Loaded {len(data)} rows from Google Sheets")
         return data
@@ -29,61 +31,35 @@ def get_parts_data():
 def build_parts_context():
     data = get_parts_data()
     if not data:
-        return "Could not load parts data from Google Sheets."
+        return "ERROR: Could not load data from Google Sheets."
 
-    headers = data[0]
-    size_columns = []
-    for i, header in enumerate(headers):
-        if header and 'x' in header.lower():
-            size_columns.append((i, header.strip()))
+    # Мы просто переводим таблицу в текстовый вид (CSV-like), 
+    # чтобы Claude сам нашел нужную колонку. Это надежнее.
+    table_text = ""
+    for row in data:
+        # Убираем лишние пробелы и объединяем через табуляцию или |
+        clean_row = [cell.strip() if cell else "" for cell in row]
+        table_text += " | ".join(clean_row) + "\n"
+    
+    return table_text
 
-    if not size_columns:
-        logger.error(f"Headers found: {headers}")
-        return "No greenhouse sizes found in the spreadsheet."
+SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses.
 
-    available_sizes = [size for _, size in size_columns]
-    context = "CEDAR-BUILT GREENHOUSE PARTS LIST:\n\n"
-    context += f"Available greenhouse sizes: {', '.join(available_sizes)}\n\n"
-    context += "Parts list:\n"
+CRITICAL RULES:
+1. Use ONLY the "RAW INVENTORY DATA" provided below to answer questions about parts and quantities.
+2. If a user asks for a size (e.g., "10x18"), find the column header that exactly matches or contains that size.
+3. List only items where the quantity for that specific size is greater than 0 or not empty.
+4. If you cannot find the requested size in the headers, list the available sizes found in the headers and ask for clarification.
+5. DO NOT invent or assume any parts or codes. If it's not in the table, it doesn't exist.
+6. Always format the output as a clean list: Item Name - Code: Quantity.
 
-    for row in data[1:]:
-        if not row or not row[0]:
-            continue
-        item = row[0].strip()
-        code = row[1].strip() if len(row) > 1 else ""
-        if not item:
-            continue
-        quantities = []
-        for col_index, size_name in size_columns:
-            if col_index < len(row):
-                qty = row[col_index].strip()
-                if qty:
-                    quantities.append(f"{size_name}: {qty}")
-        if quantities:
-            context += f"- {item} ({code}): {', '.join(quantities)}\n"
-
-    return context
-
-SYSTEM_PROMPT = """You are CBG Manager — the AI assistant for Cedar-Built Greenhouses, a woodworking shop in Abbotsford, Canada.
-
-You help shop staff with:
-1. Providing parts lists for specific greenhouse sizes
-2. Answering questions about parts, codes, and quantities
-3. Tracking work hours (arrivals, departures, lunch breaks)
-4. Inventory management
-
-Always respond in English. Be clear, concise, and practical.
-
-When someone asks about parts for a greenhouse size, provide a clear formatted list with item name, code, and quantity.
-Only include parts that have a quantity listed for that size.
-If a size is not available, tell the user which sizes ARE available.
+RAW INVENTORY DATA:
+{parts_context}
 
 For work time tracking:
-- When staff says "I'm here", "arrived", "at work" → confirm arrival and note the time
-- When staff says "going home", "leaving", "done for the day" → confirm departure
-- When staff says "lunch", "lunch break" → confirm lunch break start
-
-{parts_context}
+- Arrived/At work -> confirm arrival.
+- Leaving/Done -> confirm departure.
+- Lunch -> confirm lunch break.
 """
 
 user_conversations = {}
@@ -105,21 +81,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": f"[{user_name}, {current_time}]: {message_text}"
     })
 
-    if len(user_conversations[user_id]) > 20:
-        user_conversations[user_id] = user_conversations[user_id][-20:]
+    # Ограничиваем историю, чтобы не перегружать память
+    if len(user_conversations[user_id]) > 10:
+        user_conversations[user_id] = user_conversations[user_id][-10:]
 
-    parts_context = build_parts_context()
-    system = SYSTEM_PROMPT.format(parts_context=parts_context)
-    system += f"\n\nCurrent date and time: {current_date}, {current_time}"
+    # Обновляем контекст из таблицы при каждом запросе
+    parts_data = build_parts_context()
+    system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
+    system_instruction += f"\n\nCurrent date/time: {current_date}, {current_time}. Respond in English."
 
     try:
         response = claude.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1000,
-            system=system,
+            model="claude-3-5-sonnet-latest", # Исправленная модель
+            max_tokens=1024,
+            system=system_instruction,
             messages=user_conversations[user_id]
         )
         reply = response.content[0].text
+        
         user_conversations[user_id].append({
             "role": "assistant",
             "content": reply
@@ -128,13 +107,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Claude error: {e}")
-        await update.message.reply_text("Sorry, I encountered an error. Please try again.")
+        await update.message.reply_text("I'm having trouble accessing my brain right now. Try again in a second!")
 
 def main():
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    # Убедись, что эти переменные добавлены в Railway
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("No TELEGRAM_BOT_TOKEN found!")
+        return
+        
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("CBG Manager Bot starting...")
+    logger.info("CBG Manager Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
