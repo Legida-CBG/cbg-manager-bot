@@ -6,7 +6,6 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
-from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,16 +16,11 @@ def get_parts_data():
     try:
         creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
         creds_dict = json.loads(creds_json)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
+        gc = gspread.service_account_from_dict(creds_dict)
         spreadsheet = gc.open("Cedar-Built")
-        sheet = spreadsheet.worksheet("Sheet1")
+        sheet = spreadsheet.worksheet("Лист1")
         data = sheet.get_all_values()
-        logger.info(f"Loaded {len(data)} rows from Google Sheets")
+        logger.info(f"SUCCESS: Loaded {len(data)} rows from Google Sheets")
         return data
     except Exception as e:
         logger.error(f"Sheets error: {e}")
@@ -44,13 +38,13 @@ def build_parts_context():
             size_columns.append((i, header.strip()))
 
     if not size_columns:
-        logger.error(f"No size columns found. Headers: {headers}")
+        logger.error(f"Headers found: {headers}")
         return "No greenhouse sizes found in the spreadsheet."
 
     available_sizes = [size for _, size in size_columns]
     context = "CEDAR-BUILT GREENHOUSE PARTS LIST:\n\n"
     context += f"Available greenhouse sizes: {', '.join(available_sizes)}\n\n"
-    context += "Parts list (Item | Code | Size: Quantity):\n"
+    context += "Parts list:\n"
 
     for row in data[1:]:
         if not row or not row[0]:
