@@ -27,7 +27,7 @@ def get_parts_data():
     """Load all parts and quantities from Cedar-Built spreadsheet"""
     try:
         gc = get_sheets_client()
-        sheet = gc.open("Cedar-Built").sheet1
+        sheet = gc.open("Cedar-Built").get_worksheet(0)
         data = sheet.get_all_values()
         return data
     except Exception as e:
