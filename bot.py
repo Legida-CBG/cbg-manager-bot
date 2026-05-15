@@ -7,10 +7,11 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Используем актуальное название модели
+# Инициализация ИИ-клиента Claude с актуальной и стабильной моделью
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 def get_parts_data():
@@ -20,7 +21,6 @@ def get_parts_data():
         gc = gspread.service_account_from_dict(creds_dict)
         spreadsheet = gc.open("Cedar-Built")
         sheet = spreadsheet.worksheet("Лист1")
-        # Получаем все данные как список списков
         data = sheet.get_all_values()
         logger.info(f"SUCCESS: Loaded {len(data)} rows from Google Sheets")
         return data
@@ -33,33 +33,63 @@ def build_parts_context():
     if not data:
         return "ERROR: Could not load data from Google Sheets."
 
-    # Мы просто переводим таблицу в текстовый вид (CSV-like), 
-    # чтобы Claude сам нашел нужную колонку. Это надежнее.
-    table_text = ""
-    for row in data:
-        # Убираем лишние пробелы и объединяем через табуляцию или |
-        clean_row = [cell.strip() if cell else "" for cell in row]
-        table_text += " | ".join(clean_row) + "\n"
+    # На скриншоте видно, что заголовки (10x18, 10x20...) находятся на 3-й строке листа.
+    # В списках Python это индекс 2.
+    if len(data) < 3:
+        return "ERROR: Table has too few rows to parse headers."
+
+    headers = [cell.strip() for cell in data[2]]
     
+    table_text = "STRUCTURE OF THE TABLE:\n"
+    table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
+    table_text += "DATA:\n"
+    
+    # Данные начинаются с 4-й строки таблицы (в Python это индекс 3)
+    for row in data[3:]:
+        if len(row) < 2:
+            continue
+            
+        category = row[0].strip()
+        sub_item = row[1].strip()
+        
+        # Если вся строка пустая, пропускаем её
+        if not category and not sub_item:
+            continue
+            
+        # Склеиваем колонку А и Б для получения уникального и точного названия детали
+        full_name = f"{category} {sub_item}".strip()
+        
+        # Собираем все ячейки с количеством, начиная с колонки C (индекс 2 и далее)
+        remaining_cells = [cell.strip() if cell else "" for cell in row[2:]]
+        
+        # Записываем строку в формате понятного текстового CSV
+        table_text += f"{full_name} | " + " | ".join(remaining_cells) + "\n"
+        
     return table_text
 
-SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses.
+SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses (a woodworking shop in Abbotsford, Canada).
 
-CRITICAL RULES:
-1. Use ONLY the "RAW INVENTORY DATA" provided below to answer questions about parts and quantities.
-2. If a user asks for a size (e.g., "10x18"), find the column header that exactly matches or contains that size.
-3. List only items where the quantity for that specific size is greater than 0 or not empty.
-4. If you cannot find the requested size in the headers, list the available sizes found in the headers and ask for clarification.
-5. DO NOT invent or assume any parts or codes. If it's not in the table, it doesn't exist.
-6. Always format the output as a clean list: Item Name - Code: Quantity.
+HOW TO READ THE DATA:
+1. The inventory data is provided below as a text table where columns are separated by '|'.
+2. The headers of the columns (including greenhouse sizes like '10x18', '10x20', '10x24EX') are defined in the 'COLUMNS' section.
+3. When a user asks for a specific greenhouse size (e.g., "10x18"), look at the 'COLUMNS' row to find the exact position (index) of that size column.
+4. Scan the rows under 'DATA'. For each row, check the value in that specific size column.
+5. If the value is a number greater than 0, it means this part is required. Include it in the list.
+6. If the cell is empty, contains '-', '0', or spaces, this part is NOT needed for this size. Completely ignore it.
+
+STRICT RULES:
+- Use ONLY the provided data below. Never invent, hallucinate, or guess parts, codes, or quantities.
+- Always combine the item names accurately as provided (e.g., if row starts with 'BASEWALL GW35', the item name is 'BASEWALL GW35').
+- Format the final output as a clean, structured list grouped by logical categories if possible (e.g., Basewall, Roof Vents, etc.), showing: Item Name: Quantity.
+- If the requested size is not found in the columns, gently list all available sizes from the headers and ask the user to clarify.
 
 RAW INVENTORY DATA:
 {parts_context}
 
 For work time tracking:
-- Arrived/At work -> confirm arrival.
-- Leaving/Done -> confirm departure.
-- Lunch -> confirm lunch break.
+- When staff says "I'm here", "arrived", "at work" → confirm arrival and note the time.
+- When staff says "going home", "leaving", "done for the day" → confirm departure.
+- When staff says "lunch", "lunch break" → confirm lunch break start.
 """
 
 user_conversations = {}
@@ -81,19 +111,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": f"[{user_name}, {current_time}]: {message_text}"
     })
 
-    # Ограничиваем историю, чтобы не перегружать память
+    # Ограничиваем историю диалога (последние 10 сообщений), чтобы не перегружать память
     if len(user_conversations[user_id]) > 10:
         user_conversations[user_id] = user_conversations[user_id][-10:]
 
-    # Обновляем контекст из таблицы при каждом запросе
+    # Подгружаем свежую матрицу данных из таблицы при каждом запросе
     parts_data = build_parts_context()
     system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
-    system_instruction += f"\n\nCurrent date/time: {current_date}, {current_time}. Respond in English."
+    system_instruction += f"\n\nCurrent date/time inside the shop: {current_date}, {current_time}. Always respond in English."
 
     try:
         response = claude.messages.create(
-            model="claude-sonnet-4-5", # Исправленная модель
-            max_tokens=1024,
+            model="claude-3-5-sonnet-latest", # Стабильная актуальная модель 
+            max_tokens=1200,
             system=system_instruction,
             messages=user_conversations[user_id]
         )
@@ -107,18 +137,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Claude error: {e}")
-        await update.message.reply_text("I'm having trouble accessing my brain right now. Try again in a second!")
+        await update.message.reply_text("Sorry, I'm having trouble processing this request right now. Please try again.")
 
 def main():
-    # Убедись, что эти переменные добавлены в Railway
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("No TELEGRAM_BOT_TOKEN found!")
+        logger.error("CRITICAL: No TELEGRAM_BOT_TOKEN found in environment variables!")
         return
         
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("CBG Manager Bot is running...")
+    logger.info("CBG Manager Bot is starting...")
     app.run_polling()
 
 if __name__ == "__main__":
