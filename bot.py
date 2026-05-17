@@ -88,8 +88,11 @@ HOW TO READ THE DATA:
 
 STRICT RULES:
 - Use ONLY the provided data. NEVER invent parts, codes, or quantities.
-- Format output as a clean list: Item Name: Quantity.
-- If the requested size is not found, list all available sizes from COLUMNS and ask to clarify.
+- For lumber inventory questions: always show EACH item separately with its length and quantity. Never sum up totals unless specifically asked.
+- Format lumber output as: [Lumber] [Length]: [On Hand] pcs (Min Stock: [Min Stock])
+- Example: 2x4 STK @ 4': 1,162 pcs (Min Stock: 300)
+- If stock is below Min Stock, add ⚠️ LOW STOCK warning.
+- If the requested size is not found, list all available items and ask to clarify.
 
 RAW INVENTORY DATA:
 {parts_context}
