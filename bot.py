@@ -30,21 +30,28 @@ def build_lumber_context():
     data = get_sheet_data("Lumber")
     if not data:
         return "ERROR: Could not load lumber data."
+    
     headers = [cell.strip() for cell in data[0]]
+    logger.info(f"Lumber headers: {headers}")
+    
     table_text = "LUMBER INVENTORY:\n"
-    table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
-    table_text += "DATA:\n"
+    table_text += "COLUMNS: " + " | ".join(headers) + "\n"
+    table_text += "NOTE: Column D = 'In Stock' = CURRENT quantity. Column E = 'Min Stock' = minimum threshold.\n\n"
+    table_text += "DATA (Lumber | Category | Length | In Stock | Min Stock | Min Order):\n"
+    
     for row in data[1:]:
         if not row or not row[0].strip():
             continue
         clean_row = [cell.strip() for cell in row]
         table_text += " | ".join(clean_row) + "\n"
+    
     return table_text
 
 def build_parts_context():
     data = get_sheet_data("Parts")
     if not data:
         return "ERROR: Could not load parts data."
+    
     headers = []
     header_row_idx = 0
     for idx in [0, 1, 2]:
@@ -57,10 +64,13 @@ def build_parts_context():
     if not headers:
         headers = [cell.strip() for cell in data[0]]
         header_row_idx = 0
+    
     logger.info(f"Parts headers at row {header_row_idx}: {headers}")
+    
     table_text = "GREENHOUSE PARTS LIST:\n"
     table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
     table_text += "DATA:\n"
+    
     for row in data[header_row_idx + 1:]:
         if len(row) < 2:
             continue
@@ -73,6 +83,7 @@ def build_parts_context():
         for i in range(2, len(headers)):
             remaining_cells.append(row[i].strip() if i < len(row) else "")
         table_text += f"{full_name} | " + " | ".join(remaining_cells) + "\n"
+    
     return table_text
 
 SYSTEM_PROMPT = """You are CBG Manager — AI assistant for Cedar-Built Greenhouses in Abbotsford, Canada.
@@ -82,11 +93,15 @@ You have access to TWO data sources:
 2. GREENHOUSE PARTS LIST — parts needed for each greenhouse size
 
 HOW TO USE LUMBER DATA:
+- The data has these columns: Lumber | Category | Length | In Stock | Min Stock | Min Order
+- "In Stock" is the CURRENT quantity on hand — use this number
+- "Min Stock" is the minimum threshold — use this only for comparison
 - Show each item separately with its length
-- Format: [Lumber] [Category] @ [Length]: [On Hand] pcs (Min Stock: [Min Stock])
+- Format: [Lumber] [Category] @ [Length]: [In Stock value] pcs (Min Stock: [Min Stock value])
 - Example: 2x4 STK @ 4': 1,162 pcs (Min Stock: 300)
-- Add ⚠️ LOW STOCK if On Hand is below Min Stock
-- Add ✅ if well stocked
+- Add ⚠️ LOW STOCK if In Stock is below Min Stock
+- Add ✅ if In Stock is above Min Stock
+- CRITICAL: Never mix up "In Stock" and "Min Stock" columns
 
 HOW TO USE PARTS DATA:
 - COLUMNS row shows greenhouse sizes (10x18, 12x12, etc.)
@@ -94,10 +109,10 @@ HOW TO USE PARTS DATA:
 - List only items where quantity > 0
 - Format: Item Name (Code): Quantity
 - NEVER invent quantities — use only what is in the data
+- If size not found, list all available sizes
 
 STRICT RULES:
 - Use ONLY provided data. Never invent anything.
-- If size not found in parts, list available sizes.
 - Always respond in English.
 
 For work time tracking:
