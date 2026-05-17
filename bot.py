@@ -242,7 +242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = claude.messages.create(
-            model="claude-4-5-sonnet-20250219",
+            model="claude-sonnet-4-5",
             max_tokens=1200,
             system=system_instruction,
             messages=user_conversations[user_id]
