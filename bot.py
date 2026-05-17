@@ -6,54 +6,85 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-def get_spreadsheet():
+SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBl"
+
+def get_credentials():
     creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
     creds_dict = json.loads(creds_json)
-    gc = gspread.service_account_from_dict(creds_dict)
-    return gc.open("Cedar-Built")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 def get_sheet_data(sheet_name):
     try:
-        spreadsheet = get_spreadsheet()
+        creds = get_credentials()
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
         sheet = spreadsheet.worksheet(sheet_name)
         data = sheet.get_all_values()
         logger.info(f"SUCCESS: Loaded {len(data)} rows from '{sheet_name}'")
         return data
     except Exception as e:
-        logger.error(f"Sheets error ({sheet_name}): {e}")
+        logger.error(f"Sheets read error ({sheet_name}): {e}")
         return None
 
-def update_lumber_stock(lumber, category, length, change, operation):
-    """
-    Update IN_STOK for a specific lumber item.
-    operation: 'add' or 'subtract'
-    Returns: (success, message)
-    """
+def update_cell_direct(sheet_name, row_number, col_number, value):
+    """Update a cell using Google Sheets API directly"""
     try:
-        spreadsheet = get_spreadsheet()
-        sheet = spreadsheet.worksheet("Lumber")
-        data = sheet.get_all_values()
+        creds = get_credentials()
+        service = build("sheets", "v4", credentials=creds)
         
-        # Find the row
+        # Convert col number to letter (1=A, 2=B, 3=C, 4=D)
+        col_letter = chr(64 + col_number)
+        range_name = f"{sheet_name}!{col_letter}{row_number}"
+        
+        body = {"values": [[value]]}
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name,
+            valueInputOption="RAW",
+            body=body
+        ).execute()
+        
+        logger.info(f"Updated {range_name} = {value}")
+        return True
+    except Exception as e:
+        logger.error(f"Direct update error: {e}")
+        return False
+
+def update_lumber_stock(lumber, category, length, change, operation):
+    try:
+        data = get_sheet_data("Lumber")
+        if not data:
+            return False, "Could not read lumber data"
+        
+        search_lumber = lumber.strip().lower()
+        search_category = category.strip().lower()
+        search_length = length.strip().lower().replace("'", "").replace('"', '').strip()
+        
         for i, row in enumerate(data[1:], start=2):
             if len(row) < 4:
                 continue
+            
             row_lumber = row[0].strip().lower()
             row_category = row[1].strip().lower()
-            row_length = row[2].strip().lower().replace("'", "").replace('"', '')
-            
-            search_lumber = lumber.strip().lower()
-            search_category = category.strip().lower()
-            search_length = length.strip().lower().replace("'", "").replace('"', '')
+            row_length = row[2].strip().lower().replace("'", "").replace('"', '').strip()
             
             if row_lumber == search_lumber and row_category == search_category and row_length == search_length:
-                current = int(row[3]) if row[3].strip().isdigit() else 0
+                try:
+                    current = int(row[3].replace(',', '')) if row[3].strip() else 0
+                except:
+                    current = 0
                 
                 if operation == 'add':
                     new_value = current + change
@@ -64,23 +95,25 @@ def update_lumber_stock(lumber, category, length, change, operation):
                     new_value = current - change
                     action = f"Removed {change} pcs"
                 
-                # Update cell D (column 4 = index 4 in gspread 1-based)
-                sheet.update_cell(i, 4, new_value)
-                logger.info(f"Updated {lumber} {category} @ {length}: {current} → {new_value}")
-                return True, f"{action}. {lumber} {category} @ {length}': {current} → {new_value} pcs"
+                success = update_cell_direct("LUMBER", i, 4, new_value)
+                
+                if success:
+                    return True, f"{action}. {lumber} {category} @ {length}': {current} → {new_value} pcs"
+                else:
+                    return False, "Failed to update Google Sheets"
         
         return False, f"Item not found: {lumber} {category} @ {length}'"
         
     except Exception as e:
         logger.error(f"Update error: {e}")
-        return False, f"Error updating stock: {e}"
+        return False, f"Error: {e}"
 
 def build_lumber_context():
     data = get_sheet_data("Lumber")
     if not data:
         return "ERROR: Could not load lumber data."
     
-    table_text = "LUMBER INVENTORY (columns: LUMBER | CATEGORY | LENGTH | IN_STOK | MIN_STOCK | MIN_ORDER):\n\n"
+    table_text = "LUMBER INVENTORY:\n\n"
     for row in data[1:]:
         if not row or not row[0].strip():
             continue
@@ -92,8 +125,10 @@ def build_lumber_context():
         
         low = ""
         try:
-            if int(in_stok) < int(min_stock):
+            if int(in_stok.replace(',','')) < int(min_stock.replace(',','')):
                 low = " ⚠️ LOW"
+            else:
+                low = " ✅"
         except:
             pass
         
@@ -143,29 +178,24 @@ SYSTEM_PROMPT = """You are CBG Manager — AI assistant for Cedar-Built Greenhou
 You manage lumber inventory and greenhouse parts information.
 
 LUMBER INVENTORY RULES:
-- Column IN_STOK = current quantity on hand
-- Column MIN_STOCK = minimum threshold
-- Show each item with its IN_STOK value
+- IN_STOK = current quantity on hand
+- MIN_STOCK = minimum threshold
 - Format: [Lumber] [Category] @ [Length]': [IN_STOK] pcs (Min: [MIN_STOCK])
-- Add ⚠️ LOW if IN_STOK < MIN_STOCK, add ✅ if above
 
 STOCK UPDATE DETECTION:
 When staff mentions receiving or using lumber, extract:
 1. Lumber size (e.g. 2x4, 2x6)
 2. Category (e.g. STK, Clear, SPF)
-3. Length (e.g. 6', 8')
+3. Length (e.g. 6, 8)
 4. Quantity (number)
-5. Operation: RECEIVED/ADD or USED/TOOK/SUBTRACT
+5. Operation: ADD (received/got/delivered) or SUBTRACT (used/took/pulled)
 
-Examples of ADD phrases: "received", "got", "delivered", "added", "came in"
-Examples of SUBTRACT phrases: "used", "took", "pulled", "consumed", "taken"
-
-When you detect a stock update, respond with EXACTLY this format on the first line:
+When you detect a stock update, respond with EXACTLY this format on the FIRST line:
 STOCK_UPDATE: [ADD or SUBTRACT] | [lumber] | [category] | [length] | [quantity]
 
 Example: STOCK_UPDATE: SUBTRACT | 2x4 | STK | 6 | 100
 
-Then confirm what you understood in a friendly message.
+Then on the next lines write a friendly confirmation message.
 
 GREENHOUSE PARTS RULES:
 - Find the requested greenhouse size in COLUMNS
@@ -175,7 +205,7 @@ GREENHOUSE PARTS RULES:
 
 For work time tracking:
 - "I'm here", "arrived" → confirm arrival with time
-- "going home", "leaving" → confirm departure  
+- "going home", "leaving" → confirm departure
 - "lunch" → confirm lunch break
 
 {lumber_context}
@@ -222,13 +252,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.content[0].text
         
-        # Check if bot detected a stock update
         if reply.startswith("STOCK_UPDATE:"):
             lines = reply.split('\n', 1)
             update_line = lines[0]
             user_reply = lines[1].strip() if len(lines) > 1 else "Stock updated!"
             
-            # Parse: STOCK_UPDATE: ADD | 2x4 | STK | 6 | 100
             try:
                 parts = update_line.replace("STOCK_UPDATE:", "").strip().split("|")
                 operation = parts[0].strip().upper()
@@ -241,9 +269,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success, msg = update_lumber_stock(lumber, category, length, quantity, op)
                 
                 if success:
-                    await update.message.reply_text(f"✅ {msg}\n\n{user_reply}")
+                    final_reply = f"✅ {msg}\n\n{user_reply}"
                 else:
-                    await update.message.reply_text(f"❌ {msg}\n\n{user_reply}")
+                    final_reply = f"❌ {msg}\n\n{user_reply}"
+                    
+                await update.message.reply_text(final_reply)
             except Exception as e:
                 logger.error(f"Parse error: {e}")
                 await update.message.reply_text(user_reply)
