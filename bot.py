@@ -12,38 +12,92 @@ logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+def get_spreadsheet():
+    creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
+    creds_dict = json.loads(creds_json)
+    gc = gspread.service_account_from_dict(creds_dict)
+    return gc.open("Cedar-Built")
+
 def get_sheet_data(sheet_name):
     try:
-        creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
-        creds_dict = json.loads(creds_json)
-        gc = gspread.service_account_from_dict(creds_dict)
-        spreadsheet = gc.open("Cedar-Built")
+        spreadsheet = get_spreadsheet()
         sheet = spreadsheet.worksheet(sheet_name)
         data = sheet.get_all_values()
-        logger.info(f"SUCCESS: Loaded {len(data)} rows from sheet '{sheet_name}'")
+        logger.info(f"SUCCESS: Loaded {len(data)} rows from '{sheet_name}'")
         return data
     except Exception as e:
         logger.error(f"Sheets error ({sheet_name}): {e}")
         return None
+
+def update_lumber_stock(lumber, category, length, change, operation):
+    """
+    Update IN_STOK for a specific lumber item.
+    operation: 'add' or 'subtract'
+    Returns: (success, message)
+    """
+    try:
+        spreadsheet = get_spreadsheet()
+        sheet = spreadsheet.worksheet("Lumber")
+        data = sheet.get_all_values()
+        
+        # Find the row
+        for i, row in enumerate(data[1:], start=2):
+            if len(row) < 4:
+                continue
+            row_lumber = row[0].strip().lower()
+            row_category = row[1].strip().lower()
+            row_length = row[2].strip().lower().replace("'", "").replace('"', '')
+            
+            search_lumber = lumber.strip().lower()
+            search_category = category.strip().lower()
+            search_length = length.strip().lower().replace("'", "").replace('"', '')
+            
+            if row_lumber == search_lumber and row_category == search_category and row_length == search_length:
+                current = int(row[3]) if row[3].strip().isdigit() else 0
+                
+                if operation == 'add':
+                    new_value = current + change
+                    action = f"Added {change} pcs"
+                else:
+                    if current < change:
+                        return False, f"Cannot subtract {change} — only {current} in stock!"
+                    new_value = current - change
+                    action = f"Removed {change} pcs"
+                
+                # Update cell D (column 4 = index 4 in gspread 1-based)
+                sheet.update_cell(i, 4, new_value)
+                logger.info(f"Updated {lumber} {category} @ {length}: {current} → {new_value}")
+                return True, f"{action}. {lumber} {category} @ {length}': {current} → {new_value} pcs"
+        
+        return False, f"Item not found: {lumber} {category} @ {length}'"
+        
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        return False, f"Error updating stock: {e}"
 
 def build_lumber_context():
     data = get_sheet_data("Lumber")
     if not data:
         return "ERROR: Could not load lumber data."
     
-    headers = [cell.strip() for cell in data[0]]
-    logger.info(f"Lumber headers: {headers}")
-    
-    table_text = "LUMBER INVENTORY:\n"
-    table_text += "COLUMNS: " + " | ".join(headers) + "\n"
-    table_text += "NOTE: Column D = 'In Stock' = CURRENT quantity. Column E = 'Min Stock' = minimum threshold.\n\n"
-    table_text += "DATA (Lumber | Category | Length | In Stock | Min Stock | Min Order):\n"
-    
+    table_text = "LUMBER INVENTORY (columns: LUMBER | CATEGORY | LENGTH | IN_STOK | MIN_STOCK | MIN_ORDER):\n\n"
     for row in data[1:]:
         if not row or not row[0].strip():
             continue
-        clean_row = [cell.strip() for cell in row]
-        table_text += " | ".join(clean_row) + "\n"
+        lumber = row[0].strip()
+        category = row[1].strip() if len(row) > 1 else ""
+        length = row[2].strip() if len(row) > 2 else ""
+        in_stok = row[3].strip() if len(row) > 3 else "0"
+        min_stock = row[4].strip() if len(row) > 4 else "0"
+        
+        low = ""
+        try:
+            if int(in_stok) < int(min_stock):
+                low = " ⚠️ LOW"
+        except:
+            pass
+        
+        table_text += f"{lumber} {category} @ {length}': IN_STOK={in_stok} | MIN_STOCK={min_stock}{low}\n"
     
     return table_text
 
@@ -64,8 +118,6 @@ def build_parts_context():
     if not headers:
         headers = [cell.strip() for cell in data[0]]
         header_row_idx = 0
-    
-    logger.info(f"Parts headers at row {header_row_idx}: {headers}")
     
     table_text = "GREENHOUSE PARTS LIST:\n"
     table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
@@ -88,36 +140,42 @@ def build_parts_context():
 
 SYSTEM_PROMPT = """You are CBG Manager — AI assistant for Cedar-Built Greenhouses in Abbotsford, Canada.
 
-You have access to TWO data sources:
-1. LUMBER INVENTORY — current stock of lumber materials
-2. GREENHOUSE PARTS LIST — parts needed for each greenhouse size
+You manage lumber inventory and greenhouse parts information.
 
-HOW TO USE LUMBER DATA:
-- The data has these columns: Lumber | Category | Length | In Stock | Min Stock | Min Order
-- "In Stock" is the CURRENT quantity on hand — use this number
-- "Min Stock" is the minimum threshold — use this only for comparison
-- Show each item separately with its length
-- Format: [Lumber] [Category] @ [Length]: [In Stock value] pcs (Min Stock: [Min Stock value])
-- Example: 2x4 STK @ 4': 1,162 pcs (Min Stock: 300)
-- Add ⚠️ LOW STOCK if In Stock is below Min Stock
-- Add ✅ if In Stock is above Min Stock
-- CRITICAL: Never mix up "In Stock" and "Min Stock" columns
+LUMBER INVENTORY RULES:
+- Column IN_STOK = current quantity on hand
+- Column MIN_STOCK = minimum threshold
+- Show each item with its IN_STOK value
+- Format: [Lumber] [Category] @ [Length]': [IN_STOK] pcs (Min: [MIN_STOCK])
+- Add ⚠️ LOW if IN_STOK < MIN_STOCK, add ✅ if above
 
-HOW TO USE PARTS DATA:
-- COLUMNS row shows greenhouse sizes (10x18, 12x12, etc.)
-- Find the requested size column
-- List only items where quantity > 0
-- Format: Item Name (Code): Quantity
-- NEVER invent quantities — use only what is in the data
-- If size not found, list all available sizes
+STOCK UPDATE DETECTION:
+When staff mentions receiving or using lumber, extract:
+1. Lumber size (e.g. 2x4, 2x6)
+2. Category (e.g. STK, Clear, SPF)
+3. Length (e.g. 6', 8')
+4. Quantity (number)
+5. Operation: RECEIVED/ADD or USED/TOOK/SUBTRACT
 
-STRICT RULES:
-- Use ONLY provided data. Never invent anything.
-- Always respond in English.
+Examples of ADD phrases: "received", "got", "delivered", "added", "came in"
+Examples of SUBTRACT phrases: "used", "took", "pulled", "consumed", "taken"
+
+When you detect a stock update, respond with EXACTLY this format on the first line:
+STOCK_UPDATE: [ADD or SUBTRACT] | [lumber] | [category] | [length] | [quantity]
+
+Example: STOCK_UPDATE: SUBTRACT | 2x4 | STK | 6 | 100
+
+Then confirm what you understood in a friendly message.
+
+GREENHOUSE PARTS RULES:
+- Find the requested greenhouse size in COLUMNS
+- List only items with quantity > 0
+- NEVER invent quantities
+- If size not found, list available sizes
 
 For work time tracking:
 - "I'm here", "arrived" → confirm arrival with time
-- "going home", "leaving" → confirm departure
+- "going home", "leaving" → confirm departure  
 - "lunch" → confirm lunch break
 
 {lumber_context}
@@ -163,11 +221,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=user_conversations[user_id]
         )
         reply = response.content[0].text
+        
+        # Check if bot detected a stock update
+        if reply.startswith("STOCK_UPDATE:"):
+            lines = reply.split('\n', 1)
+            update_line = lines[0]
+            user_reply = lines[1].strip() if len(lines) > 1 else "Stock updated!"
+            
+            # Parse: STOCK_UPDATE: ADD | 2x4 | STK | 6 | 100
+            try:
+                parts = update_line.replace("STOCK_UPDATE:", "").strip().split("|")
+                operation = parts[0].strip().upper()
+                lumber = parts[1].strip()
+                category = parts[2].strip()
+                length = parts[3].strip()
+                quantity = int(parts[4].strip())
+                
+                op = 'add' if operation == 'ADD' else 'subtract'
+                success, msg = update_lumber_stock(lumber, category, length, quantity, op)
+                
+                if success:
+                    await update.message.reply_text(f"✅ {msg}\n\n{user_reply}")
+                else:
+                    await update.message.reply_text(f"❌ {msg}\n\n{user_reply}")
+            except Exception as e:
+                logger.error(f"Parse error: {e}")
+                await update.message.reply_text(user_reply)
+        else:
+            await update.message.reply_text(reply)
+        
         user_conversations[user_id].append({
             "role": "assistant",
             "content": reply
         })
-        await update.message.reply_text(reply)
 
     except Exception as e:
         logger.error(f"Claude error: {e}")
