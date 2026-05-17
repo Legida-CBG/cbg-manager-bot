@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-def get_parts_data():
+def get_sheet_data(sheet_name):
     try:
         creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
         creds_dict = json.loads(creds_json)
@@ -24,22 +24,37 @@ def get_parts_data():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
         spreadsheet = gc.open("Cedar-Built")
-        sheet = spreadsheet.worksheet("Lumber")
+        sheet = spreadsheet.worksheet(sheet_name)
         data = sheet.get_all_values()
-        logger.info(f"SUCCESS: Loaded {len(data)} rows from Google Sheets")
+        logger.info(f"SUCCESS: Loaded {len(data)} rows from sheet '{sheet_name}'")
         return data
     except Exception as e:
-        logger.error(f"Sheets error: {e}")
+        logger.error(f"Sheets error ({sheet_name}): {e}")
         return None
 
-def build_parts_context():
-    data = get_parts_data()
+def build_lumber_context():
+    data = get_sheet_data("Lumber")
     if not data:
-        return "ERROR: Could not load data from Google Sheets."
+        return "ERROR: Could not load lumber data."
+    
+    headers = [cell.strip() for cell in data[0]]
+    table_text = "LUMBER INVENTORY:\n"
+    table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
+    table_text += "DATA:\n"
+    for row in data[1:]:
+        if not row or not row[0].strip():
+            continue
+        clean_row = [cell.strip() for cell in row]
+        table_text += " | ".join(clean_row) + "\n"
+    return table_text
+
+def build_parts_context():
+    data = get_sheet_data("Parts")
+    if not data:
+        return "ERROR: Could not load parts data."
 
     headers = []
     header_row_idx = 0
-
     for idx in [0, 1, 2]:
         if len(data) > idx:
             row_check = [cell.strip() for cell in data[idx] if cell.strip()]
@@ -47,17 +62,15 @@ def build_parts_context():
                 headers = [cell.strip() for cell in data[idx]]
                 header_row_idx = idx
                 break
-
     if not headers:
         headers = [cell.strip() for cell in data[0]]
         header_row_idx = 0
 
-    logger.info(f"Headers found at row {header_row_idx}: {headers}")
+    logger.info(f"Parts headers at row {header_row_idx}: {headers}")
 
-    table_text = "STRUCTURE OF THE TABLE:\n"
+    table_text = "GREENHOUSE PARTS LIST:\n"
     table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
     table_text += "DATA:\n"
-
     for row in data[header_row_idx + 1:]:
         if len(row) < 2:
             continue
@@ -68,39 +81,44 @@ def build_parts_context():
         full_name = f"{category} {sub_item}".strip()
         remaining_cells = []
         for i in range(2, len(headers)):
-            if i < len(row):
-                remaining_cells.append(row[i].strip())
-            else:
-                remaining_cells.append("")
+            remaining_cells.append(row[i].strip() if i < len(row) else "")
         table_text += f"{full_name} | " + " | ".join(remaining_cells) + "\n"
-
     return table_text
 
-SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses (a woodworking shop in Abbotsford, Canada).
+SYSTEM_PROMPT = """You are CBG Manager — AI assistant for Cedar-Built Greenhouses in Abbotsford, Canada.
 
-HOW TO READ THE DATA:
-1. The inventory data is provided below as a text table where columns are separated by '|'.
-2. The headers of the columns (including greenhouse sizes like '10x18', '10x20', '10x24EX') are defined in the 'COLUMNS' section.
-3. When a user asks for a specific greenhouse size (e.g., "10x18"), find that exact column in COLUMNS.
-4. For each row in DATA, check the value in that size column.
-5. If the value is a number greater than 0, include this part in the list.
-6. If the cell is empty or 0, skip it completely.
+You have access to TWO data sources:
+
+1. LUMBER INVENTORY — current stock of lumber materials
+2. GREENHOUSE PARTS LIST — parts needed for each greenhouse size
+
+HOW TO USE LUMBER DATA:
+- Show each item separately with its length
+- Format: [Lumber] [Category] @ [Length]: [On Hand] pcs (Min Stock: [Min Stock])
+- Example: 2x4 STK @ 4': 1,162 pcs (Min Stock: 300)
+- Add ⚠️ LOW STOCK if On Hand is below Min Stock
+- Add ✅ if well stocked
+
+HOW TO USE PARTS DATA:
+- COLUMNS row shows greenhouse sizes (10x18, 12x12, etc.)
+- Find the requested size column
+- List only items where quantity > 0
+- Format: Item Name (Code): Quantity
+- NEVER invent quantities — use only what's in the data
 
 STRICT RULES:
-- Use ONLY the provided data. NEVER invent parts, codes, or quantities.
-- For lumber inventory questions: always show EACH item separately with its length and quantity. Never sum up totals unless specifically asked.
-- Format lumber output as: [Lumber] [Length]: [On Hand] pcs (Min Stock: [Min Stock])
-- Example: 2x4 STK @ 4': 1,162 pcs (Min Stock: 300)
-- If stock is below Min Stock, add ⚠️ LOW STOCK warning.
-- If the requested size is not found, list all available items and ask to clarify.
-
-RAW INVENTORY DATA:
-{parts_context}
+- Use ONLY provided data. Never invent anything.
+- If size not found in parts, list available sizes.
+- Always respond in English.
 
 For work time tracking:
-- "I'm here", "arrived", "at work" → confirm arrival and note the time.
-- "going home", "leaving", "done for the day" → confirm departure.
-- "lunch", "lunch break" → confirm lunch break start.
+- "I'm here", "arrived" → confirm arrival with time
+- "going home", "leaving" → confirm departure
+- "lunch" → confirm lunch break
+
+{lumber_context}
+
+{parts_context}
 """
 
 user_conversations = {}
@@ -125,14 +143,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_conversations[user_id]) > 10:
         user_conversations[user_id] = user_conversations[user_id][-10:]
 
-    parts_data = build_parts_context()
-    system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
-    system_instruction += f"\n\nCurrent date/time: {current_date}, {current_time}. Always respond in English."
+    lumber_context = build_lumber_context()
+    parts_context = build_parts_context()
+    system_instruction = SYSTEM_PROMPT.format(
+        lumber_context=lumber_context,
+        parts_context=parts_context
+    )
+    system_instruction += f"\n\nCurrent date/time: {current_date}, {current_time}."
 
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=1200,
+            max_tokens=1500,
             system=system_instruction,
             messages=user_conversations[user_id]
         )
