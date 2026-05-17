@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация ИИ-клиента Claude с новейшей моделью 4.5 Sonnet
+# Инициализация ИИ-клиента Claude с моделью 4.5 Sonnet
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBl"
@@ -94,6 +94,7 @@ def update_lumber_stock(message_text, qty_change):
     if not best_rows:
         return f"NOT_FOUND|{search_tokens}"
 
+    # Проверка на неоднозначность совпадений
     if len(best_rows) > 1 and best_rows[0][0] == best_rows[1][0]:
         alternatives = [r[2] for r in best_rows[:3]]
         return f"AMBIGUOUS|{', '.join(alternatives)}"
@@ -101,7 +102,7 @@ def update_lumber_stock(message_text, qty_change):
     target_row_idx = best_rows[0][1]
     matched_item_name = best_rows[0][2]
     
-    target_col_idx = 4 
+    target_col_idx = 4  # На листе LUMBER колонка Stock — это 4-й столбец (D)
     row_data = data[target_row_idx - 1]
     
     try:
@@ -180,6 +181,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from {user_name}: {message_text}")
     text_lower = message_text.lower()
     
+    # Регулярка для перехвата действий со складом
     match_change = re.search(r'(took|added|minus|plus|\+|\-)\s*(\d+)', text_lower)
     
     if match_change:
@@ -189,6 +191,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         result = update_lumber_stock(message_text, change_sign)
         
+        # Защитная проверка: если функция вернула None или пустую строку
+        if not result or not isinstance(result, str):
+            logger.error(f"Incomplete execution in stock function. Result is: {result}")
+            await update.message.reply_text("⚠️ Internal error while modifying database. Check script execution logic.")
+            return
+
         if result.startswith("SUCCESS"):
             _, item_name, old_qty, new_qty = result.split("|")
             action_verb = "removed from" if change_sign < 0 else "added to"
@@ -212,7 +220,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Please verify specifications (Size, Grade, Length)."
             )
             return
+        else:
+            await update.message.reply_text(f"⚠️ Stock operation notification: {result}")
+            return
 
+    # Обычный диалог с Claude 4.5
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
@@ -230,7 +242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = claude.messages.create(
-            model="claude-4-5-sonnet-20250219",  # Обновленный ID на официальную Claude 4.5 Sonnet
+            model="claude-4-5-sonnet-20250219",
             max_tokens=1200,
             system=system_instruction,
             messages=user_conversations[user_id]
