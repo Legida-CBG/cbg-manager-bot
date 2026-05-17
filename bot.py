@@ -237,7 +237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_conversations[user_id] = user_conversations[user_id][-10:]
 
     parts_data = build_parts_context()
-    system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
+    system_instruction = SYSTEM_PROMPT + f"\n\nINVENTORY DATA FROM GOOGLE SHEETS:\n{parts_data}"
     system_instruction += f"\n\nCurrent date/time inside the shop: {current_date}, {current_time}. Always respond in English."
 
     try:
