@@ -24,7 +24,7 @@ def get_parts_data():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
         spreadsheet = gc.open("Cedar-Built")
-        sheet = spreadsheet.worksheet("Лист1")
+        sheet = spreadsheet.worksheet("Lumber")
         data = sheet.get_all_values()
         logger.info(f"SUCCESS: Loaded {len(data)} rows from Google Sheets")
         return data
