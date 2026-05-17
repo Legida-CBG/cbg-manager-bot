@@ -34,16 +34,13 @@ def get_parts_data():
     return None
 
 def update_inventory_stock(text_message, qty_change):
-    """
-    Сканирует таблицу, находит лучшую строку по совпадению ключевых слов и обновляет Lumber Stock
-    """
     sheet = get_sheet_connection()
     if not sheet:
-        return "ERROR: Database connection failed."
+        return "ERROR_CONN|Database connection failed."
         
     data = sheet.get_all_values()
     if len(data) < 3:
-        return "ERROR: Spreadsheet is too small."
+        return "ERROR_SIZE|Spreadsheet is too small."
         
     headers = [cell.strip().lower() for cell in data[2]]
     
@@ -55,36 +52,47 @@ def update_inventory_stock(text_message, qty_change):
             break
             
     if target_col_idx == -1:
-        return "ERROR: 'Lumber Stock' column not found in headers."
+        return "ERROR_COL|'Lumber Stock' column not found in headers."
         
     # Очищаем текст сообщения от цифр и команд для точного поиска деталей
     words_to_remove = ['took', 'added', 'minus', 'plus', 'of', 'from', 'warehouse', 'stock', 'to', 'the', 'items', 'pieces', 'pcs']
     clean_text = text_message.lower()
     for w in words_to_remove:
         clean_text = clean_text.replace(w, '')
-    clean_text = re.sub(r'\d+', '', clean_text) # Удаляем сами числа количества
+    clean_text = re.sub(r'\b\d+\b', '', clean_text) # Удаляем отдельно стоящие числа (количество)
     
-    # Извлекаем все значимые токены (например: ['2x4', 'stk', "6'"])
+    # Извлекаем токены (например: ['2x4', 'stk', "6'"])
     search_tokens = [t.strip() for t in re.split(r'[\s,]+', clean_text) if len(t.strip()) >= 2 or "'" in t or '"' in t]
     
     if not search_tokens:
-        return "ERROR: Could not extract item description from message."
+        return "ERROR_TOKENS|Could not extract item description from message."
         
-    target_row_idx = -1
-    max_matches = 0
+    best_rows = []
     
-    # Ищем строку с максимальным совпадением токенов
+    # Ищем строки с совпадениями
     for idx, row in enumerate(data[3:], start=4):
         if len(row) < 2: continue
         full_row_name = f"{row[0]} {row[1]}".strip().lower()
         
         matches = sum(1 for token in search_tokens if token in full_row_name)
-        if matches > max_matches and matches >= len(search_tokens) - 1:
-            max_matches = matches
-            target_row_idx = idx
+        if matches > 0:
+            best_rows.append((matches, idx, f"{row[0]} {row[1]}".strip()))
+            
+    # Сортируем по количеству совпадений (сначала максимальные)
+    best_rows.sort(key=lambda x: x[0], reverse=True)
 
-    if target_row_idx == -1:
-        return f"ERROR: No matching lumber item found for tokens: {search_tokens}"
+    if not best_rows:
+        return f"NOT_FOUND|{search_tokens}"
+        
+    # Если первое место имеет мало совпадений или есть неоднозначность, выводим ошибку совпадения
+    # Но если у нас есть четкий лидер, берем его
+    if len(best_rows) > 1 and best_rows[0][0] == best_rows[1][0]:
+        # Несколько одинаковых совпадений (например, забыли указать 2x4 или 2x6)
+        alternatives = [r[2] for r in best_rows[:3]]
+        return f"AMBIGUOUS|{', '.join(alternatives)}"
+        
+    target_row_idx = best_rows[0][1]
+    matched_item_name = best_rows[0][2]
         
     # Читаем текущее значение ячейки количества
     try:
@@ -96,15 +104,14 @@ def update_inventory_stock(text_message, qty_change):
         
     new_val = current_val + qty_change
     if new_val < 0:
-        new_val = 0  # Запас на складе не уходит в минус
+        new_val = 0
         
     # Записываем обновленное число в Google Таблицу
     try:
         sheet.update_cell(target_row_idx, target_col_idx + 1, str(new_val))
-        matched_item_name = f"{data[target_row_idx - 1][0]} {data[target_row_idx - 1][1]}".strip()
         return f"SUCCESS|{matched_item_name}|{current_val}|{new_val}"
     except Exception as e:
-        return f"ERROR: Failed to update cell: {e}"
+        return f"ERROR_WRITE|Failed to update cell: {e}"
 
 def build_parts_context():
     data = get_parts_data()
@@ -150,14 +157,7 @@ def build_parts_context():
     return table_text
 
 SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses.
-
-HOW TO READ THE DATA:
-1. Inventory data has columns separated by '|'. Greenhouse sizes and 'Lumber Stock' are defined in 'COLUMNS'.
-2. When answering user questions, use the exact quantities matching the columns.
-
-STRICT RULES:
-- Never guess or hallucinate parts. 
-- Always respond in English.
+Always respond in English.
 """
 
 user_conversations = {}
@@ -173,17 +173,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_lower = message_text.lower()
     
-    # Регулярное выражение для поиска количества и действия (поддерживает "+ 10", "- 5", "took 10", "added 5")
+    # Ищем шаблоны изменения остатков: "took 10", "-10", "added 5", "+5"
     match_change = re.search(r'(took|added|minus|plus|\+|\-)\s*(\d+)', text_lower)
     
     if match_change:
         action = match_change.group(1)
         quantity = int(match_change.group(2))
-        
-        # Определяем направление изменения
         change_sign = -quantity if action in ['took', 'minus', '-'] else quantity
         
-        # Пытаемся обновить ячейку склада
+        # Вызов функции изменения склада
         result = update_inventory_stock(message_text, change_sign)
         
         if result.startswith("SUCCESS"):
@@ -196,10 +194,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Previous Stock: {old_qty} → **Current Stock: {new_qty}**"
             )
             return
-        else:
-            logger.warning(f"Stock script bypassed to AI: {result}")
+        elif result.startswith("AMBIGUOUS"):
+            _, alternatives = result.split("|")
+            await update.message.reply_text(
+                f"⚠️ **Specify item size!** I found multiple options matching your request:\n`{alternatives}`\n\n"
+                f"Please reply with more details (e.g., include '2x4' or '2x6')."
+            )
+            return
+        elif result.startswith("NOT_FOUND"):
+            _, tokens = result.split("|")
+            await update.message.reply_text(
+                f"❌ **Item not found!** Could not find any item matching details from your message.\n"
+                f"Please check the spelling or codes in the Google Sheet."
+            )
+            return
 
-    # Стандартная обработка через Claude
+    # Стандартная обработка через Claude, если это обычный вопрос
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
@@ -242,7 +252,7 @@ def main():
         
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("CBG Manager Bot with Auto Stock Search starting...")
+    logger.info("CBG Manager Bot with Advanced Stock Search starting...")
     app.run_polling()
 
 if __name__ == "__main__":
