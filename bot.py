@@ -88,4 +88,4 @@ def update_lumber_stock(message_text, qty_change):
 
     best_rows.sort(key=lambda x: x[0], reverse=True)
 
-    if not best_rows:
+    if not best_rows:    return f"NOT_FOUND|{search_tokens}"    
