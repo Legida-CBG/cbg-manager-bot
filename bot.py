@@ -1,216 +1,163 @@
 import os
 import json
 import logging
+import re
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Инициализация ИИ-клиента Claude
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBl"
-
-def get_credentials():
-    creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
-    creds_dict = json.loads(creds_json)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
-
-def get_sheet_data(sheet_name):
+def get_sheet_connection():
     try:
-        creds = get_credentials()
-        gc = gspread.authorize(creds)
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(sheet_name)
-        data = sheet.get_all_values()
-        logger.info(f"SUCCESS: Loaded {len(data)} rows from '{sheet_name}'")
-        return data
+        creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
+        creds_dict = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds_dict)
+        spreadsheet = gc.open("Cedar-Built")
+        sheet = spreadsheet.worksheet("Лист1")
+        return sheet
     except Exception as e:
-        logger.error(f"Sheets read error ({sheet_name}): {e}")
+        logger.error(f"Failed to connect to Google Sheets: {e}")
         return None
 
-def update_cell_direct(sheet_name, row_number, col_number, value):
-    """Update a cell using Google Sheets API directly"""
-    try:
-        creds = get_credentials()
-        service = build("sheets", "v4", credentials=creds)
-        
-        # Convert col number to letter (1=A, 2=B, 3=C, 4=D)
-        col_letter = chr(64 + col_number)
-        range_name = f"{sheet_name}!{col_letter}{row_number}"
-        
-        body = {"values": [[value]]}
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_name,
-            valueInputOption="RAW",
-            body=body
-        ).execute()
-        
-        logger.info(f"Updated {range_name} = {value}")
-        return True
-    except Exception as e:
-        logger.error(f"Direct update error: {e}")
-        return False
+def get_parts_data():
+    sheet = get_sheet_connection()
+    if sheet:
+        return sheet.get_all_values()
+    return None
 
-def update_lumber_stock(lumber, category, length, change, operation):
-    try:
-        data = get_sheet_data("Lumber")
-        if not data:
-            return False, "Could not read lumber data"
+def update_inventory_stock(text_message, qty_change):
+    """
+    Сканирует таблицу, находит лучшую строку по совпадению ключевых слов и обновляет Lumber Stock
+    """
+    sheet = get_sheet_connection()
+    if not sheet:
+        return "ERROR: Database connection failed."
         
-        search_lumber = lumber.strip().lower()
-        search_category = category.strip().lower()
-        search_length = length.strip().lower().replace("'", "").replace('"', '').strip()
+    data = sheet.get_all_values()
+    if len(data) < 3:
+        return "ERROR: Spreadsheet is too small."
         
-        for i, row in enumerate(data[1:], start=2):
-            if len(row) < 4:
-                continue
+    headers = [cell.strip().lower() for cell in data[2]]
+    
+    # Ищем индекс колонки Lumber Stock
+    target_col_idx = -1
+    for i, h in enumerate(headers):
+        if 'lumber stock' in h or 'stock' in h:
+            target_col_idx = i
+            break
             
-            row_lumber = row[0].strip().lower()
-            row_category = row[1].strip().lower()
-            row_length = row[2].strip().lower().replace("'", "").replace('"', '').strip()
-            
-            if row_lumber == search_lumber and row_category == search_category and row_length == search_length:
-                try:
-                    current = int(row[3].replace(',', '')) if row[3].strip() else 0
-                except:
-                    current = 0
-                
-                if operation == 'add':
-                    new_value = current + change
-                    action = f"Added {change} pcs"
-                else:
-                    if current < change:
-                        return False, f"Cannot subtract {change} — only {current} in stock!"
-                    new_value = current - change
-                    action = f"Removed {change} pcs"
-                
-                success = update_cell_direct("LUMBER", i, 4, new_value)
-                
-                if success:
-                    return True, f"{action}. {lumber} {category} @ {length}': {current} → {new_value} pcs"
-                else:
-                    return False, "Failed to update Google Sheets"
+    if target_col_idx == -1:
+        return "ERROR: 'Lumber Stock' column not found in headers."
         
-        return False, f"Item not found: {lumber} {category} @ {length}'"
+    # Очищаем текст сообщения от цифр и команд для точного поиска деталей
+    words_to_remove = ['took', 'added', 'minus', 'plus', 'of', 'from', 'warehouse', 'stock', 'to', 'the', 'items', 'pieces', 'pcs']
+    clean_text = text_message.lower()
+    for w in words_to_remove:
+        clean_text = clean_text.replace(w, '')
+    clean_text = re.sub(r'\d+', '', clean_text) # Удаляем сами числа количества
+    
+    # Извлекаем все значимые токены (например: ['2x4', 'stk', "6'"])
+    search_tokens = [t.strip() for t in re.split(r'[\s,]+', clean_text) if len(t.strip()) >= 2 or "'" in t or '"' in t]
+    
+    if not search_tokens:
+        return "ERROR: Could not extract item description from message."
         
-    except Exception as e:
-        logger.error(f"Update error: {e}")
-        return False, f"Error: {e}"
+    target_row_idx = -1
+    max_matches = 0
+    
+    # Ищем строку с максимальным совпадением токенов
+    for idx, row in enumerate(data[3:], start=4):
+        if len(row) < 2: continue
+        full_row_name = f"{row[0]} {row[1]}".strip().lower()
+        
+        matches = sum(1 for token in search_tokens if token in full_row_name)
+        if matches > max_matches and matches >= len(search_tokens) - 1:
+            max_matches = matches
+            target_row_idx = idx
 
-def build_lumber_context():
-    data = get_sheet_data("Lumber")
-    if not data:
-        return "ERROR: Could not load lumber data."
-    
-    table_text = "LUMBER INVENTORY:\n\n"
-    for row in data[1:]:
-        if not row or not row[0].strip():
-            continue
-        lumber = row[0].strip()
-        category = row[1].strip() if len(row) > 1 else ""
-        length = row[2].strip() if len(row) > 2 else ""
-        in_stok = row[3].strip() if len(row) > 3 else "0"
-        min_stock = row[4].strip() if len(row) > 4 else "0"
+    if target_row_idx == -1:
+        return f"ERROR: No matching lumber item found for tokens: {search_tokens}"
         
-        low = ""
-        try:
-            if int(in_stok.replace(',','')) < int(min_stock.replace(',','')):
-                low = " ⚠️ LOW"
-            else:
-                low = " ✅"
-        except:
-            pass
+    # Читаем текущее значение ячейки количества
+    try:
+        current_val_str = data[target_row_idx - 1][target_col_idx].strip()
+        current_val_str = current_val_str.replace("-", "0").strip()
+        current_val = int(current_val_str) if current_val_str.isdigit() else 0
+    except Exception:
+        current_val = 0
         
-        table_text += f"{lumber} {category} @ {length}': IN_STOK={in_stok} | MIN_STOCK={min_stock}{low}\n"
-    
-    return table_text
+    new_val = current_val + qty_change
+    if new_val < 0:
+        new_val = 0  # Запас на складе не уходит в минус
+        
+    # Записываем обновленное число в Google Таблицу
+    try:
+        sheet.update_cell(target_row_idx, target_col_idx + 1, str(new_val))
+        matched_item_name = f"{data[target_row_idx - 1][0]} {data[target_row_idx - 1][1]}".strip()
+        return f"SUCCESS|{matched_item_name}|{current_val}|{new_val}"
+    except Exception as e:
+        return f"ERROR: Failed to update cell: {e}"
 
 def build_parts_context():
-    data = get_sheet_data("Parts")
+    data = get_parts_data()
     if not data:
-        return "ERROR: Could not load parts data."
-    
+        return "ERROR: Could not load data from Google Sheets."
+
     headers = []
-    header_row_idx = 0
-    for idx in [0, 1, 2]:
+    header_row_idx = 2
+    
+    for idx in [2, 1, 0]:
         if len(data) > idx:
             row_check = [cell.strip() for cell in data[idx] if cell.strip()]
-            if any('x' in c.lower() for c in row_check):
+            if any('x' in c.lower() or 'stock' in c.lower() for c in row_check):
                 headers = [cell.strip() for cell in data[idx]]
                 header_row_idx = idx
                 break
+                
     if not headers:
-        headers = [cell.strip() for cell in data[0]]
-        header_row_idx = 0
-    
-    table_text = "GREENHOUSE PARTS LIST:\n"
+        headers = [cell.strip() for cell in data[2]] if len(data) > 2 else []
+
+    table_text = "STRUCTURE OF THE TABLE:\n"
     table_text += "COLUMNS: " + " | ".join(headers) + "\n\n"
     table_text += "DATA:\n"
     
-    for row in data[header_row_idx + 1:]:
-        if len(row) < 2:
-            continue
+    start_row = header_row_idx + 1
+    for row in data[start_row:]:
+        if len(row) < 2: continue
         category = row[0].strip()
         sub_item = row[1].strip()
-        if not category and not sub_item:
-            continue
+        if not category and not sub_item: continue
+            
         full_name = f"{category} {sub_item}".strip()
+        
         remaining_cells = []
         for i in range(2, len(headers)):
-            remaining_cells.append(row[i].strip() if i < len(row) else "")
+            if i < len(row):
+                remaining_cells.append(row[i].strip())
+            else:
+                remaining_cells.append("")
+                
         table_text += f"{full_name} | " + " | ".join(remaining_cells) + "\n"
-    
+        
     return table_text
 
-SYSTEM_PROMPT = """You are CBG Manager — AI assistant for Cedar-Built Greenhouses in Abbotsford, Canada.
+SYSTEM_PROMPT = """You are CBG Manager — a precise AI assistant for Cedar-Built Greenhouses.
 
-You manage lumber inventory and greenhouse parts information.
+HOW TO READ THE DATA:
+1. Inventory data has columns separated by '|'. Greenhouse sizes and 'Lumber Stock' are defined in 'COLUMNS'.
+2. When answering user questions, use the exact quantities matching the columns.
 
-LUMBER INVENTORY RULES:
-- IN_STOK = current quantity on hand
-- MIN_STOCK = minimum threshold
-- Format: [Lumber] [Category] @ [Length]': [IN_STOK] pcs (Min: [MIN_STOCK])
-
-STOCK UPDATE DETECTION:
-When staff mentions receiving or using lumber, extract:
-1. Lumber size (e.g. 2x4, 2x6)
-2. Category (e.g. STK, Clear, SPF)
-3. Length (e.g. 6, 8)
-4. Quantity (number)
-5. Operation: ADD (received/got/delivered) or SUBTRACT (used/took/pulled)
-
-When you detect a stock update, respond with EXACTLY this format on the FIRST line:
-STOCK_UPDATE: [ADD or SUBTRACT] | [lumber] | [category] | [length] | [quantity]
-
-Example: STOCK_UPDATE: SUBTRACT | 2x4 | STK | 6 | 100
-
-Then on the next lines write a friendly confirmation message.
-
-GREENHOUSE PARTS RULES:
-- Find the requested greenhouse size in COLUMNS
-- List only items with quantity > 0
-- NEVER invent quantities
-- If size not found, list available sizes
-
-For work time tracking:
-- "I'm here", "arrived" → confirm arrival with time
-- "going home", "leaving" → confirm departure
-- "lunch" → confirm lunch break
-
-{lumber_context}
-
-{parts_context}
+STRICT RULES:
+- Never guess or hallucinate parts. 
+- Always respond in English.
 """
 
 user_conversations = {}
@@ -224,6 +171,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Message from {user_name}: {message_text}")
 
+    text_lower = message_text.lower()
+    
+    # Регулярное выражение для поиска количества и действия (поддерживает "+ 10", "- 5", "took 10", "added 5")
+    match_change = re.search(r'(took|added|minus|plus|\+|\-)\s*(\d+)', text_lower)
+    
+    if match_change:
+        action = match_change.group(1)
+        quantity = int(match_change.group(2))
+        
+        # Определяем направление изменения
+        change_sign = -quantity if action in ['took', 'minus', '-'] else quantity
+        
+        # Пытаемся обновить ячейку склада
+        result = update_inventory_stock(message_text, change_sign)
+        
+        if result.startswith("SUCCESS"):
+            _, item_name, old_qty, new_qty = result.split("|")
+            action_verb = "removed" if change_sign < 0 else "added"
+            await update.message.reply_text(
+                f"✅ **Stock Updated!**\n"
+                f"Item: `{item_name}`\n"
+                f"Action: Successfully {action_verb} {quantity} pcs.\n"
+                f"Previous Stock: {old_qty} → **Current Stock: {new_qty}**"
+            )
+            return
+        else:
+            logger.warning(f"Stock script bypassed to AI: {result}")
+
+    # Стандартная обработка через Claude
     if user_id not in user_conversations:
         user_conversations[user_id] = []
 
@@ -235,68 +211,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_conversations[user_id]) > 10:
         user_conversations[user_id] = user_conversations[user_id][-10:]
 
-    lumber_context = build_lumber_context()
-    parts_context = build_parts_context()
-    system_instruction = SYSTEM_PROMPT.format(
-        lumber_context=lumber_context,
-        parts_context=parts_context
-    )
-    system_instruction += f"\n\nCurrent date/time: {current_date}, {current_time}."
+    parts_data = build_parts_context()
+    system_instruction = SYSTEM_PROMPT.format(parts_context=parts_data)
+    system_instruction += f"\n\nCurrent date/time inside the shop: {current_date}, {current_time}. Always respond in English."
 
     try:
         response = claude.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1500,
+            model="claude-3-5-sonnet-latest", 
+            max_tokens=1200,
             system=system_instruction,
             messages=user_conversations[user_id]
         )
         reply = response.content[0].text
         
-        if reply.startswith("STOCK_UPDATE:"):
-            lines = reply.split('\n', 1)
-            update_line = lines[0]
-            user_reply = lines[1].strip() if len(lines) > 1 else "Stock updated!"
-            
-            try:
-                parts = update_line.replace("STOCK_UPDATE:", "").strip().split("|")
-                operation = parts[0].strip().upper()
-                lumber = parts[1].strip()
-                category = parts[2].strip()
-                length = parts[3].strip()
-                quantity = int(parts[4].strip())
-                
-                op = 'add' if operation == 'ADD' else 'subtract'
-                success, msg = update_lumber_stock(lumber, category, length, quantity, op)
-                
-                if success:
-                    final_reply = f"✅ {msg}\n\n{user_reply}"
-                else:
-                    final_reply = f"❌ {msg}\n\n{user_reply}"
-                    
-                await update.message.reply_text(final_reply)
-            except Exception as e:
-                logger.error(f"Parse error: {e}")
-                await update.message.reply_text(user_reply)
-        else:
-            await update.message.reply_text(reply)
-        
         user_conversations[user_id].append({
             "role": "assistant",
             "content": reply
         })
+        await update.message.reply_text(reply)
 
     except Exception as e:
         logger.error(f"Claude error: {e}")
-        await update.message.reply_text("Sorry, I'm having trouble right now. Please try again.")
+        await update.message.reply_text("Sorry, I'm having trouble processing this request right now.")
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("No TELEGRAM_BOT_TOKEN found!")
+        logger.error("CRITICAL: No TELEGRAM_BOT_TOKEN found!")
         return
+        
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("CBG Manager Bot is starting...")
+    logger.info("CBG Manager Bot with Auto Stock Search starting...")
     app.run_polling()
 
 if __name__ == "__main__":
