@@ -123,7 +123,7 @@ def update_lumber_stock(message_text, qty_change):
         return "ERROR_WRITE|Failed to write to Google Sheet cell."
 
 def build_parts_context():
-    data = get_sheet_data("Лист1")
+    data = get_sheet_data("PARTS")
     if not data:
         return "ERROR: Could not load data from main sheet."
 
