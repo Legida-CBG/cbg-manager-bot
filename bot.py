@@ -1,20 +1,24 @@
 import os
 import json
 import logging
+import base64
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
-
+ 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+ 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
+ 
 SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBI"
-
+ 
+# Хранилище ожидающих подтверждений: user_id → данные для записи
+pending_confirmations = {}
+ 
 def get_credentials():
     creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
     creds_dict = json.loads(creds_json)
@@ -23,7 +27,7 @@ def get_credentials():
         "https://www.googleapis.com/auth/drive"
     ]
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
-
+ 
 def get_sheet_data(sheet_name):
     try:
         creds = get_credentials()
@@ -36,7 +40,13 @@ def get_sheet_data(sheet_name):
     except Exception as e:
         logger.error(f"Sheets read error ({sheet_name}): {e}")
         return None
-
+ 
+def get_worksheet(sheet_name):
+    creds = get_credentials()
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    return spreadsheet.worksheet(sheet_name)
+ 
 def build_lumber_context():
     data = get_sheet_data("LUMBER")
     if not data:
@@ -46,7 +56,7 @@ def build_lumber_context():
     text += "Size | Category | Length | In Stock | Min Stock\n"
     text += "-" * 50 + "\n"
     
-    for row in data[2:]:  # пропускаем 2 строки заголовков
+    for row in data[2:]:
         if len(row) < 4:
             continue
         size = row[0].strip()
@@ -61,7 +71,7 @@ def build_lumber_context():
         text += f"{size} | {category} | {length} | {in_stock} | {min_stock}\n"
     
     return text
-
+ 
 def build_parts_context():
     data = get_sheet_data("PARTS")
     if not data:
@@ -84,48 +94,285 @@ def build_parts_context():
         text += " | ".join(cells) + "\n"
     
     return text
-
+ 
+def extract_pdf_data_with_claude(pdf_bytes):
+    """Отправляет PDF в Claude и получает структурированный список деталей."""
+    pdf_base64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    
+    response = claude.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_base64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": """Look at PAGE 1 ONLY of this PDF. It contains a parts specification table for a greenhouse order.
+ 
+Extract the following:
+1. Greenhouse model (e.g. "12x14") - found at the top of page 1
+2. All parts from the table with their ITEM, SIZE/CODE, and QUANT. (quantity)
+ 
+Return ONLY valid JSON in this exact format, no other text:
+{
+  "model": "12x14",
+  "parts": [
+    {"item": "BASEWALL", "size_code": "5'-7 1/2\"", "quantity": 2},
+    {"item": "ROOF VENTS", "size_code": "RV-3", "quantity": 2}
+  ]
+}
+ 
+Important: use only the QUANT. column for quantity (ignore CRATE # column)."""
+                }
+            ]
+        }]
+    )
+    
+    raw = response.content[0].text.strip()
+    # Убираем markdown обёртку если есть
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    
+    return json.loads(raw)
+ 
+def write_to_list_sheet(model, parts):
+    """
+    Записывает данные в лист LIST.
+    Возвращает словарь с результатами:
+    {
+        'updated': число обновлённых строк,
+        'added': число новых строк,
+        'column_existed': True/False
+    }
+    """
+    sheet = get_worksheet("LIST")
+    data = sheet.get_all_values()
+    
+    if not data:
+        raise Exception("LIST sheet is empty")
+    
+    # Строка 1 — заголовки (Item, Size/Code, 6x8, 6x10, ...)
+    headers = data[0]
+    
+    # Ищем колонку с нашей моделью теплицы
+    model_col_index = None
+    for i, h in enumerate(headers):
+        if h.strip() == model.strip():
+            model_col_index = i
+            break
+    
+    column_existed = model_col_index is not None
+    
+    # Если колонки нет — добавляем в конец
+    if model_col_index is None:
+        model_col_index = len(headers)
+        sheet.update_cell(1, model_col_index + 1, model)
+        # Обновляем headers локально
+        headers.append(model)
+    
+    # Строим индекс существующих строк: (item, size_code) → номер строки (1-based)
+    row_index = {}
+    for row_num, row in enumerate(data[1:], start=2):
+        item = row[0].strip() if len(row) > 0 else ""
+        size_code = row[1].strip() if len(row) > 1 else ""
+        if item:
+            row_index[(item.upper(), size_code.upper())] = row_num
+    
+    updated = 0
+    added = 0
+    
+    for part in parts:
+        item = part["item"].strip()
+        size_code = part["size_code"].strip()
+        quantity = part["quantity"]
+        
+        key = (item.upper(), size_code.upper())
+        
+        if key in row_index:
+            # Строка найдена — обновляем ячейку
+            row_num = row_index[key]
+            sheet.update_cell(row_num, model_col_index + 1, quantity)
+            updated += 1
+        else:
+            # Строки нет — добавляем новую строку
+            new_row_num = len(data) + 1 + added
+            # Заполняем пустыми значениями до нужной колонки
+            new_row = [""] * (model_col_index + 1)
+            new_row[0] = item
+            new_row[1] = size_code
+            new_row[model_col_index] = quantity
+            sheet.append_row(new_row)
+            added += 1
+    
+    return {
+        "updated": updated,
+        "added": added,
+        "column_existed": column_existed
+    }
+ 
+def check_column_has_data(model):
+    """Проверяет: есть ли уже данные в колонке с этой моделью теплицы."""
+    data = get_sheet_data("LIST")
+    if not data:
+        return False
+    
+    headers = data[0]
+    model_col_index = None
+    for i, h in enumerate(headers):
+        if h.strip() == model.strip():
+            model_col_index = i
+            break
+    
+    if model_col_index is None:
+        return False  # Колонки вообще нет — данных нет
+    
+    # Проверяем есть ли хоть одна непустая ячейка в этой колонке
+    for row in data[1:]:
+        if model_col_index < len(row) and row[model_col_index].strip():
+            return True
+    
+    return False
+ 
 SYSTEM_PROMPT = """You are CBG Manager — an AI assistant for Cedar-Built Greenhouses wood shop in Abbotsford, Canada.
-
+ 
 You have access to two data sources:
-
+ 
 1. LUMBER INVENTORY — current stock of lumber (2x4, 2x6, etc.)
 2. GREENHOUSE PARTS LIST — parts needed for each greenhouse size
-
+ 
 RULES:
 - Always use the data provided. Never invent numbers.
 - Answer in English.
 - Be concise and clear.
 - For lumber questions: look up the exact size, category and length.
 - For parts questions: find the greenhouse size column and list all parts with quantities > 0.
-
+ 
 {lumber_context}
-
+ 
 {parts_context}
 """
-
+ 
 user_conversations = {}
-
+ 
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает PDF файл отправленный в Telegram."""
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name or "Staff"
+    
+    await update.message.reply_text("📄 PDF received. Reading the order specification...")
+    
+    try:
+        # Скачиваем PDF
+        file = await update.message.document.get_file()
+        pdf_bytes = await file.download_as_bytearray()
+        
+        await update.message.reply_text("🔍 Extracting parts list from page 1...")
+        
+        # Извлекаем данные через Claude
+        extracted = extract_pdf_data_with_claude(bytes(pdf_bytes))
+        model = extracted["model"]
+        parts = extracted["parts"]
+        
+        logger.info(f"Extracted model: {model}, parts count: {len(parts)}")
+        
+        # Проверяем есть ли уже данные в колонке
+        has_data = check_column_has_data(model)
+        
+        if has_data:
+            # Сохраняем данные в ожидании подтверждения
+            pending_confirmations[user_id] = {
+                "model": model,
+                "parts": parts
+            }
+            
+            await update.message.reply_text(
+                f"⚠️ Column *{model}* already has data in the LIST sheet.\n\n"
+                f"Found *{len(parts)} parts* in this PDF.\n\n"
+                f"Do you want to *overwrite* the existing data?\n\n"
+                f"Reply *YES* to overwrite, or *NO* to cancel.",
+                parse_mode="Markdown"
+            )
+        else:
+            # Данных нет — пишем сразу
+            await update.message.reply_text(f"✅ Found model *{model}* with *{len(parts)} parts*. Writing to LIST sheet...", parse_mode="Markdown")
+            
+            result = write_to_list_sheet(model, parts)
+            
+            await update.message.reply_text(
+                f"✅ *Done!* Data written to LIST sheet.\n\n"
+                f"📋 Model: *{model}*\n"
+                f"🔄 Updated rows: *{result['updated']}*\n"
+                f"➕ New rows added: *{result['added']}*",
+                parse_mode="Markdown"
+            )
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error from Claude: {e}")
+        await update.message.reply_text("❌ Could not read the PDF structure. Please make sure it's a standard CBG order specification.")
+    except Exception as e:
+        logger.error(f"PDF processing error: {e}")
+        await update.message.reply_text(f"❌ Error processing PDF: {str(e)}")
+ 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "Staff"
-    message_text = update.message.text
+    message_text = update.message.text.strip()
     current_time = datetime.now().strftime("%I:%M %p")
     current_date = datetime.now().strftime("%B %d, %Y")
-
+ 
     logger.info(f"Message from {user_name}: {message_text}")
-
+ 
+    # Проверяем ожидает ли этот пользователь подтверждения перезаписи
+    if user_id in pending_confirmations:
+        if message_text.upper() in ["YES", "Y", "ДА"]:
+            data = pending_confirmations.pop(user_id)
+            model = data["model"]
+            parts = data["parts"]
+            
+            await update.message.reply_text(f"✍️ Overwriting data for *{model}*...", parse_mode="Markdown")
+            
+            try:
+                result = write_to_list_sheet(model, parts)
+                await update.message.reply_text(
+                    f"✅ *Done!* Data overwritten in LIST sheet.\n\n"
+                    f"📋 Model: *{model}*\n"
+                    f"🔄 Updated rows: *{result['updated']}*\n"
+                    f"➕ New rows added: *{result['added']}*",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Write error: {e}")
+                await update.message.reply_text(f"❌ Error writing to sheet: {str(e)}")
+            return
+        
+        elif message_text.upper() in ["NO", "N", "НЕТ"]:
+            pending_confirmations.pop(user_id)
+            await update.message.reply_text("❌ Cancelled. No data was changed.")
+            return
+ 
+    # Обычный разговор с Claude
     if user_id not in user_conversations:
         user_conversations[user_id] = []
-
+ 
     user_conversations[user_id].append({
         "role": "user",
         "content": f"[{user_name}, {current_time}]: {message_text}"
     })
-
+ 
     if len(user_conversations[user_id]) > 10:
         user_conversations[user_id] = user_conversations[user_id][-10:]
-
+ 
     lumber_data = build_lumber_context()
     parts_data = build_parts_context()
     
@@ -134,7 +381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_context=parts_data
     )
     system_instruction += f"\nCurrent date/time: {current_date}, {current_time}."
-
+ 
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-5",
@@ -143,27 +390,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=user_conversations[user_id]
         )
         reply = response.content[0].text
-
+ 
         user_conversations[user_id].append({
             "role": "assistant",
             "content": reply
         })
         await update.message.reply_text(reply)
-
+ 
     except Exception as e:
         logger.error(f"Claude error: {e}")
         await update.message.reply_text("Sorry, I'm having trouble processing this request right now.")
-
+ 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("CRITICAL: No TELEGRAM_BOT_TOKEN found!")
         return
-
+ 
     app = Application.builder().token(token).build()
+    
+    # Обработчик PDF файлов
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    
+    # Обработчик текстовых сообщений
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
     logger.info("CBG Manager Bot is running...")
     app.run_polling()
-
+ 
 if __name__ == "__main__":
     main()
+ 
+
+
+
+
+
