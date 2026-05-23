@@ -120,10 +120,10 @@ def extract_pdf_data_with_claude(pdf_bytes):
 Extract the following:
 1. Greenhouse model - found at the top of page 1. 
    Rules for model name:
-   - Keep only the size (e.g. 12x20) and EX or EX2 suffix if present
-   - Remove any other words like SHD, SHED, EXTENSION, or customer names
+   - Keep ONLY the size (e.g. 12x20) and EX or EX2 suffix if present
+   - Remove ALL other words: SHD, DRM, SHED, EXTENSION, customer names, or any other text
    - No spaces: write as 12x20EX not "12x20 EX"
-   - Examples: "12x20 EX SHD" → "12x20EX", "8x12" → "8x12", "10x16 EX2" → "10x16EX2"
+   - Examples: "12x20 EX SHD" → "12x20EX", "10x14 DRM" → "10x14", "8x12" → "8x12", "10x16 EX2 SHD" → "10x16EX2"
 
 2. All parts from the table with their ITEM, SIZE/CODE, and QUANT. (quantity)
 
