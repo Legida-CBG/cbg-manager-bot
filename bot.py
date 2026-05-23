@@ -201,20 +201,43 @@ def write_to_list_sheet(model, parts):
             if size_code.upper() not in index_code:
                 index_code[size_code.upper()] = row_num
 
+    def normalize_code(code):
+        """Заменяет визуально похожие символы: S→5, O→0 в кодах деталей."""
+        # Применяем только если в коде есть цифры (это код, а не слово)
+        if not any(c.isdigit() for c in code):
+            return code
+        result = ""
+        for ch in code:
+            if ch == 'S':
+                result += '5'
+            elif ch == 'O':
+                result += '0'
+            else:
+                result += ch
+        return result
+
     updated = 0
-    added = 0
+    skipped = 0
     matched_by_code = 0
 
     for part in parts:
         item = part["item"].strip()
         size_code = part["size_code"].strip()
         quantity = part["quantity"]
+        size_code_norm = normalize_code(size_code)
 
         key_both = (item.upper(), size_code.upper())
+        key_both_norm = (item.upper(), size_code_norm.upper())
 
         if key_both in index_both:
             # Приоритет 1: точное совпадение Item + Size/Code
             row_num = index_both[key_both]
+            sheet.update_cell(row_num, model_col_index + 1, quantity)
+            updated += 1
+
+        elif key_both_norm in index_both:
+            # Приоритет 1б: совпадение после нормализации символов
+            row_num = index_both[key_both_norm]
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             updated += 1
 
@@ -224,19 +247,21 @@ def write_to_list_sheet(model, parts):
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             matched_by_code += 1
 
+        elif size_code_norm.upper() in index_code:
+            # Приоритет 2б: совпадение по нормализованному Size/Code
+            row_num = index_code[size_code_norm.upper()]
+            sheet.update_cell(row_num, model_col_index + 1, quantity)
+            matched_by_code += 1
+
         else:
-            # Приоритет 3: ничего не найдено — добавляем новую строку
-            new_row = [""] * (model_col_index + 1)
-            new_row[0] = item
-            new_row[1] = size_code
-            new_row[model_col_index] = quantity
-            sheet.append_row(new_row)
-            added += 1
+            # Не найдено — пропускаем, не добавляем
+            skipped += 1
+            logger.info(f"SKIPPED (not found): {item} | {size_code}")
 
     return {
         "updated": updated,
         "matched_by_code": matched_by_code,
-        "added": added,
+        "skipped": skipped,
         "column_existed": column_existed
     }
 
@@ -333,7 +358,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📋 Model: *{model}*\n"
                 f"🔄 Matched by name+code: *{result['updated']}*\n"
                 f"🔍 Matched by code only: *{result['matched_by_code']}*\n"
-                f"➕ New rows added: *{result['added']}*",
+                f"⏭ Not found (skipped): *{result['skipped']}*",
                 parse_mode="Markdown"
             )
     
@@ -367,8 +392,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"✅ *Done!* Data overwritten in LIST sheet.\n\n"
                     f"📋 Model: *{model}*\n"
-                    f"🔄 Updated rows: *{result['updated']}*\n"
-                    f"➕ New rows added: *{result['added']}*",
+                    f"🔄 Matched by name+code: *{result['updated']}*\n"
+                    f"🔍 Matched by code only: *{result['matched_by_code']}*\n"
+                    f"⏭ Not found (skipped): *{result['skipped']}*",
                     parse_mode="Markdown"
                 )
             except Exception as e:
