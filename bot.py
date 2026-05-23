@@ -195,7 +195,8 @@ def write_to_list_sheet(model, parts):
 
     for row_num, row in enumerate(data[1:], start=2):
         item = row[0].strip() if len(row) > 0 else ""
-        size_code = norm_apostrophe(row[1].strip()) if len(row) > 1 else ""
+        size_code_raw = norm_apostrophe(row[1].strip()) if len(row) > 1 else ""
+        size_code = size_code_raw.replace(' ', '')  # убираем пробелы для сравнения
         if not item and not size_code:
             continue
         key_both = (item.upper(), size_code.upper())
@@ -231,7 +232,8 @@ def write_to_list_sheet(model, parts):
             elif ch == '8' and (prev.isalpha() or prev == ' ' or prev == chr(0)) and (nxt.isalpha() or nxt == ' ' or nxt == '-' or nxt == chr(0)):
                 result[i] = 'B'
 
-        return ''.join(result)
+        # Убираем все пробелы из кода для сравнения
+        return ''.join(result).replace(' ', '')
 
     updated = 0
     skipped = 0
