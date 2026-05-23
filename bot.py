@@ -208,8 +208,8 @@ def write_to_list_sheet(model, parts):
         """
         Нормализует код детали:
         1. Заменяет умные апострофы на прямые
-        2. Заменяет S->5 и O->0 ТОЛЬКО если символ окружён цифрами или дефисами
-           (не трогает S в словах: LB S-1, GS35 остаются как есть)
+        2. Заменяет S->5 и O->0 только между цифрами/дефисами
+        3. Заменяет 8->B только если 8 стоит среди букв (OCR путает B и 8)
         """
         # Нормализуем апострофы и кавычки
         code = code.replace(chr(0x2019), chr(39)).replace(chr(0x2018), chr(39))
@@ -219,10 +219,18 @@ def write_to_list_sheet(model, parts):
         for i, ch in enumerate(result):
             prev = result[i-1] if i > 0 else chr(0)
             nxt = result[i+1] if i < len(result)-1 else chr(0)
+
+            # S->5 и O->0 только между цифрами или дефисами
             if ch == 'S' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
                 result[i] = '5'
             elif ch == 'O' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
                 result[i] = '0'
+
+            # 8->B только если окружена буквами или пробелом (не цифрами)
+            # Например: L8 D-1 -> LB D-1, но 8x12 остаётся 8x12
+            elif ch == '8' and (prev.isalpha() or prev == ' ' or prev == chr(0)) and (nxt.isalpha() or nxt == ' ' or nxt == '-' or nxt == chr(0)):
+                result[i] = 'B'
+
         return ''.join(result)
 
     updated = 0
