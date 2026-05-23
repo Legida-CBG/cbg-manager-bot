@@ -189,32 +189,41 @@ def write_to_list_sheet(model, parts):
     index_both = {}
     index_code = {}
 
+    def norm_apostrophe(s):
+        """Нормализует апострофы в строке из Google Sheets."""
+        return s.replace(chr(0x2019), chr(39)).replace(chr(0x2018), chr(39)).replace(chr(0x201c), chr(34)).replace(chr(0x201d), chr(34))
+
     for row_num, row in enumerate(data[1:], start=2):
         item = row[0].strip() if len(row) > 0 else ""
-        size_code = row[1].strip() if len(row) > 1 else ""
+        size_code = norm_apostrophe(row[1].strip()) if len(row) > 1 else ""
         if not item and not size_code:
             continue
         key_both = (item.upper(), size_code.upper())
         index_both[key_both] = row_num
         if size_code:
-            # Если один код встречается в нескольких строках — берём первое вхождение
             if size_code.upper() not in index_code:
                 index_code[size_code.upper()] = row_num
 
     def normalize_code(code):
-        """Заменяет визуально похожие символы: S→5, O→0 в кодах деталей."""
-        # Применяем только если в коде есть цифры (это код, а не слово)
-        if not any(c.isdigit() for c in code):
-            return code
-        result = ""
-        for ch in code:
-            if ch == 'S':
-                result += '5'
-            elif ch == 'O':
-                result += '0'
-            else:
-                result += ch
-        return result
+        """
+        Нормализует код детали:
+        1. Заменяет умные апострофы на прямые
+        2. Заменяет S->5 и O->0 ТОЛЬКО если символ окружён цифрами или дефисами
+           (не трогает S в словах: LB S-1, GS35 остаются как есть)
+        """
+        # Нормализуем апострофы и кавычки
+        code = code.replace(chr(0x2019), chr(39)).replace(chr(0x2018), chr(39))
+        code = code.replace(chr(0x201c), chr(34)).replace(chr(0x201d), chr(34))
+
+        result = list(code)
+        for i, ch in enumerate(result):
+            prev = result[i-1] if i > 0 else chr(0)
+            nxt = result[i+1] if i < len(result)-1 else chr(0)
+            if ch == 'S' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
+                result[i] = '5'
+            elif ch == 'O' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
+                result[i] = '0'
+        return ''.join(result)
 
     updated = 0
     skipped = 0
