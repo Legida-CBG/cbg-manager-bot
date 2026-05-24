@@ -238,12 +238,15 @@ def write_to_list_sheet(model, parts):
     updated = 0
     skipped = 0
     matched_by_code = 0
+    skipped_list = []
 
     for part in parts:
         item = part["item"].strip()
-        size_code = part["size_code"].strip()
+        size_code_raw = part["size_code"].strip()
         quantity = part["quantity"]
-        size_code_norm = normalize_code(size_code)
+        # Убираем пробелы из PDF-кода для сравнения (как и в индексе таблицы)
+        size_code = size_code_raw.replace(" ", "")
+        size_code_norm = normalize_code(size_code_raw)  # нормализация без пробелов
 
         key_both = (item.upper(), size_code.upper())
         key_both_norm = (item.upper(), size_code_norm.upper())
@@ -275,12 +278,14 @@ def write_to_list_sheet(model, parts):
         else:
             # Не найдено — пропускаем, не добавляем
             skipped += 1
-            logger.info(f"SKIPPED (not found): {item} | {size_code}")
+            skipped_list.append(f"{item} | {size_code_raw}")
+            logger.info(f"SKIPPED (not found): {item} | {size_code_raw}")
 
     return {
         "updated": updated,
         "matched_by_code": matched_by_code,
         "skipped": skipped,
+        "skipped_list": skipped_list,
         "column_existed": column_existed
     }
 
@@ -372,12 +377,16 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             result = write_to_list_sheet(model, parts)
 
+            skipped_text = ""
+            if result['skipped_list']:
+                skipped_text = "\n\n⚠️ *Not found:*\n" + "\n".join(f"• {s}" for s in result['skipped_list'])
             await update.message.reply_text(
                 f"✅ *Done!* Data written to LIST sheet.\n\n"
                 f"📋 Model: *{model}*\n"
                 f"🔄 Matched by name+code: *{result['updated']}*\n"
                 f"🔍 Matched by code only: *{result['matched_by_code']}*\n"
-                f"⏭ Not found (skipped): *{result['skipped']}*",
+                f"⏭ Not found (skipped): *{result['skipped']}*"
+                + skipped_text,
                 parse_mode="Markdown"
             )
     
@@ -408,12 +417,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 result = write_to_list_sheet(model, parts)
+                skipped_text = ""
+                if result['skipped_list']:
+                    skipped_text = "\n\n⚠️ *Not found:*\n" + "\n".join(f"• {s}" for s in result['skipped_list'])
                 await update.message.reply_text(
                     f"✅ *Done!* Data overwritten in LIST sheet.\n\n"
                     f"📋 Model: *{model}*\n"
                     f"🔄 Matched by name+code: *{result['updated']}*\n"
                     f"🔍 Matched by code only: *{result['matched_by_code']}*\n"
-                    f"⏭ Not found (skipped): *{result['skipped']}*",
+                    f"⏭ Not found (skipped): *{result['skipped']}*"
+                    + skipped_text,
                     parse_mode="Markdown"
                 )
             except Exception as e:
