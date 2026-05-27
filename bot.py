@@ -183,9 +183,6 @@ def write_to_list_sheet(model, parts):
         sheet.update_cell(1, model_col_index + 1, model)
         headers.append(model)
 
-    # Строим два индекса:
-    # 1. (item_upper, size_code_upper) → row_num  — точное совпадение обоих
-    # 2. size_code_upper → row_num                 — совпадение только по коду
     index_both = {}
     index_code = {}
 
@@ -196,7 +193,7 @@ def write_to_list_sheet(model, parts):
     for row_num, row in enumerate(data[1:], start=2):
         item = row[0].strip() if len(row) > 0 else ""
         size_code_raw = norm_apostrophe(row[1].strip()) if len(row) > 1 else ""
-        size_code = size_code_raw.replace(' ', '')  # убираем пробелы для сравнения
+        size_code = size_code_raw.replace(' ', '')
         if not item and not size_code:
             continue
         key_both = (item.upper(), size_code.upper())
@@ -206,13 +203,6 @@ def write_to_list_sheet(model, parts):
                 index_code[size_code.upper()] = row_num
 
     def normalize_code(code):
-        """
-        Нормализует код детали:
-        1. Заменяет умные апострофы на прямые
-        2. Заменяет S->5 и O->0 только между цифрами/дефисами
-        3. Заменяет 8->B только если 8 стоит среди букв (OCR путает B и 8)
-        """
-        # Нормализуем апострофы и кавычки
         code = code.replace(chr(0x2019), chr(39)).replace(chr(0x2018), chr(39))
         code = code.replace(chr(0x201c), chr(34)).replace(chr(0x201d), chr(34))
 
@@ -221,18 +211,13 @@ def write_to_list_sheet(model, parts):
             prev = result[i-1] if i > 0 else chr(0)
             nxt = result[i+1] if i < len(result)-1 else chr(0)
 
-            # S->5 и O->0 только между цифрами или дефисами
             if ch == 'S' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
                 result[i] = '5'
             elif ch == 'O' and (prev.isdigit() or prev == '-') and (nxt.isdigit() or nxt == '-'):
                 result[i] = '0'
-
-            # 8->B только если окружена буквами или пробелом (не цифрами)
-            # Например: L8 D-1 -> LB D-1, но 8x12 остаётся 8x12
             elif ch == '8' and (prev.isalpha() or prev == ' ' or prev == chr(0)) and (nxt.isalpha() or nxt == ' ' or nxt == '-' or nxt == chr(0)):
                 result[i] = 'B'
 
-        # Убираем все пробелы из кода для сравнения
         return ''.join(result).replace(' ', '')
 
     updated = 0
@@ -244,39 +229,29 @@ def write_to_list_sheet(model, parts):
         item = part["item"].strip()
         size_code_raw = part["size_code"].strip()
         quantity = part["quantity"]
-        # Убираем пробелы из PDF-кода для сравнения (как и в индексе таблицы)
         size_code = size_code_raw.replace(" ", "")
-        size_code_norm = normalize_code(size_code_raw)  # нормализация без пробелов
+        size_code_norm = normalize_code(size_code_raw)
 
         key_both = (item.upper(), size_code.upper())
         key_both_norm = (item.upper(), size_code_norm.upper())
 
         if key_both in index_both:
-            # Приоритет 1: точное совпадение Item + Size/Code
             row_num = index_both[key_both]
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             updated += 1
-
         elif key_both_norm in index_both:
-            # Приоритет 1б: совпадение после нормализации символов
             row_num = index_both[key_both_norm]
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             updated += 1
-
         elif size_code.upper() in index_code:
-            # Приоритет 2: совпадение только по Size/Code
             row_num = index_code[size_code.upper()]
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             matched_by_code += 1
-
         elif size_code_norm.upper() in index_code:
-            # Приоритет 2б: совпадение по нормализованному Size/Code
             row_num = index_code[size_code_norm.upper()]
             sheet.update_cell(row_num, model_col_index + 1, quantity)
             matched_by_code += 1
-
         else:
-            # Не найдено — пропускаем, не добавляем
             skipped += 1
             skipped_list.append(f"{item} | {size_code_raw}")
             logger.info(f"SKIPPED (not found): {item} | {size_code_raw}")
@@ -303,9 +278,8 @@ def check_column_has_data(model):
             break
     
     if model_col_index is None:
-        return False  # Колонки вообще нет — данных нет
+        return False
     
-    # Проверяем есть ли хоть одна непустая ячейка в этой колонке
     for row in data[1:]:
         if model_col_index < len(row) and row[model_col_index].strip():
             return True
@@ -341,24 +315,20 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📄 PDF received. Reading the order specification...")
     
     try:
-        # Скачиваем PDF
         file = await update.message.document.get_file()
         pdf_bytes = await file.download_as_bytearray()
         
         await update.message.reply_text("🔍 Extracting parts list from page 1...")
         
-        # Извлекаем данные через Claude
         extracted = extract_pdf_data_with_claude(bytes(pdf_bytes))
         model = extracted["model"]
         parts = extracted["parts"]
         
         logger.info(f"Extracted model: {model}, parts count: {len(parts)}")
         
-        # Проверяем есть ли уже данные в колонке
         has_data = check_column_has_data(model)
         
         if has_data:
-            # Сохраняем данные в ожидании подтверждения
             pending_confirmations[user_id] = {
                 "model": model,
                 "parts": parts
@@ -372,7 +342,6 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         else:
-            # Данных нет — пишем сразу
             await update.message.reply_text(f"✅ Found model *{model}* with *{len(parts)} parts*. Writing to LIST sheet...", parse_mode="Markdown")
             
             result = write_to_list_sheet(model, parts)
@@ -461,6 +430,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system_instruction += f"\nCurrent date/time: {current_date}, {current_time}."
 
     try:
+        # ✅ Отправляем placeholder сразу
+        thinking_msg = await update.message.reply_text("⏳ Processing your request...")
+
         response = claude.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1200,
@@ -473,7 +445,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "role": "assistant",
             "content": reply
         })
-        await update.message.reply_text(reply)
+
+        # ✅ Заменяем placeholder готовым ответом
+        await thinking_msg.edit_text(reply)
 
     except Exception as e:
         logger.error(f"Claude error: {e}")
