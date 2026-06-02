@@ -230,14 +230,42 @@ async def send_checks_pdf(update, order_num, client_name, model):
 @flask_app.route("/webhook/new_order", methods=["POST"])
 def webhook_new_order():
     """
-    Make отправляет POST запрос с JSON:
-    {"order_num": "2699", "client_name": "Spicer", "model": "12x20EX"}
+    Принимает два формата от Make:
+    1. {"data": "2699|Spicer|12x20EX"} или {"data": "2699-Spicer 12x20EX"}
+    2. {"order_num": "2699", "client_name": "Spicer", "model": "12x20EX"}
     """
     try:
         data = request.get_json(force=True)
-        order_num = data.get("order_num", "").strip()
-        client_name = data.get("client_name", "").strip()
-        model = data.get("model", "").strip()
+
+        if "data" in data:
+            raw = data["data"].strip()
+            parts = raw.split("|")
+            if len(parts) == 3:
+                order_num = parts[0].strip()
+                client_name = parts[1].strip()
+                model_raw = parts[2].strip()
+            else:
+                space_idx = raw.find(" ")
+                if space_idx == -1:
+                    return jsonify({"error": "Invalid data format"}), 400
+                left = raw[:space_idx]
+                right = raw[space_idx+1:]
+                dash_idx = left.find("-")
+                if dash_idx == -1:
+                    return jsonify({"error": "Invalid data format"}), 400
+                order_num = left[:dash_idx]
+                client_name = left[dash_idx+1:]
+                model_raw = right
+            model_match = re.search(r'\d+[x×X]\d+(?:EX2?)?', model_raw, re.IGNORECASE)
+            if model_match:
+                model = re.sub(r'[×X]', 'x', model_match.group(0))
+                model = re.sub(r'ex2?', lambda m: m.group(0).upper(), model, flags=re.IGNORECASE)
+            else:
+                model = model_raw
+        else:
+            order_num = data.get("order_num", "").strip()
+            client_name = data.get("client_name", "").strip()
+            model = data.get("model", "").strip()
 
         if not order_num or not client_name or not model:
             return jsonify({"error": "Missing fields"}), 400
