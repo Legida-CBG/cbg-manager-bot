@@ -3,3 +3,4 @@ anthropic==0.40.0
 gspread==5.12.4
 google-auth==2.38.0
 google-api-python-client==2.125.0
+reportlab==4.2.5
