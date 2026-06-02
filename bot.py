@@ -6,6 +6,7 @@ import logging
 import base64
 import asyncio
 import threading
+import queue
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
@@ -27,6 +28,7 @@ pending_confirmations = {}
 
 flask_app = Flask(__name__)
 telegram_app_ref = None  # глобальная ссылка на Application
+order_queue = queue.Queue()  # очередь заказов от Make
 
 def get_credentials():
     creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
@@ -276,21 +278,15 @@ def webhook_new_order():
 
         logger.info(f"Webhook received: {order_num} | {client_name} | {model}")
 
-        # Запускаем async функцию в event loop бота
-        loop = telegram_app_ref.bot._loop if hasattr(telegram_app_ref.bot, '_loop') else None
-        
-        async def process():
-            bot = telegram_app_ref.bot
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"📋 *New order received!*\n*Order:* {order_num}\n*Client:* {client_name}\n*Model:* {model}\n\nGenerating Checks Sheet PDF...",
-                parse_mode="Markdown"
-            )
-            await send_checks_pdf_to_chat(bot, chat_id, order_num, client_name, model)
-
-        asyncio.run_coroutine_threadsafe(process(), telegram_app_ref.bot._event_loop if hasattr(telegram_app_ref.bot, '_event_loop') else asyncio.get_event_loop())
-
-        return jsonify({"status": "ok"}), 200
+        # Кладём заказ в очередь — бот обработает в своём event loop
+        order_queue.put({
+            "order_num": order_num,
+            "client_name": client_name,
+            "model": model,
+            "chat_id": chat_id
+        })
+        logger.info(f"Order added to queue: {order_num} | {client_name} | {model}")
+        return jsonify({"status": "ok", "queued": True}), 200
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -474,6 +470,32 @@ def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask webhook server started")
+
+    # Запускаем обработчик очереди заказов
+    async def process_order_queue():
+        while True:
+            try:
+                order = order_queue.get_nowait()
+                try:
+                    bot = app.bot
+                    await bot.send_message(
+                        chat_id=order["chat_id"],
+                        text=f"📋 *New order received!*\n*Order:* {order['order_num']}\n*Client:* {order['client_name']}\n*Model:* {order['model']}\n\nGenerating Checks Sheet PDF...",
+                        parse_mode="Markdown"
+                    )
+                    await send_checks_pdf_to_chat(bot, order["chat_id"], order["order_num"], order["client_name"], order["model"])
+                except Exception as e:
+                    logger.error(f"Queue process error: {e}")
+            except queue.Empty:
+                pass
+            await asyncio.sleep(1)
+
+    app.job_queue  # ensure job queue exists
+    
+    async def post_init(application):
+        asyncio.create_task(process_order_queue())
+    
+    app.post_init = post_init
 
     logger.info("CBG Manager Bot is running...")
     app.run_polling()
