@@ -9,8 +9,8 @@ import threading
 import queue
 from datetime import datetime
 from flask import Flask, request, jsonify
-from telegram import Update, Bot, ReplyKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, Bot
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,12 +25,7 @@ SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBI"
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 pending_confirmations = {}
-awaiting_order_photo = set()  # user_id тех, кто нажал "🆕 New Order" и должен прислать скриншот
-
-MAIN_MENU = ReplyKeyboardMarkup(
-    [["🆕 New Order"]],
-    resize_keyboard=True
-)
+pending_photo = {}  # user_id → {order_num, client_name} ожидают фото
 
 flask_app = Flask(__name__)
 telegram_app_ref = None  # глобальная ссылка на Application
@@ -329,70 +324,139 @@ def parse_new_order_message(text: str):
     model = re.sub(r'ex2?', lambda m: m.group(0).upper(), model, flags=re.IGNORECASE)
     return {"order_num": order_num, "client_name": client_name, "model": model}
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to CBG Manager Bot!\nTap the button below to submit a new order, or just type a question about parts/lumber.",
-        reply_markup=MAIN_MENU
+
+def extract_model_from_image(image_bytes: bytes) -> dict:
+    """
+    Отправляет фото PDF спецификации в Claude Vision.
+    Возвращает {"model": "10x18EX"} или {"error": "..."}
+    """
+    import base64
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": """This is a greenhouse order specification from Cedar-Built Greenhouses.
+
+Find the greenhouse size at the top of the table (e.g. "10' x 18' FREESTANDING GREENHOUSE").
+Also check if there is a row called "PORTICO" in the table.
+
+Rules for model name:
+- Format: WIDTHxLENGTH (e.g. 10x18)
+- If PORTICO row exists → add EX suffix (e.g. 10x18EX)
+- If no PORTICO → no suffix (e.g. 10x18)
+- Use only numbers and x, no spaces or apostrophes
+
+Return ONLY valid JSON, nothing else:
+{"model": "10x18EX"}"""
+                }
+            ]
+        }]
     )
 
-async def process_extracted_order(update: Update, extracted: dict):
-    """Общая логика после того как данные заказа извлечены (из PDF или из фото)."""
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    return json.loads(raw)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает фото PDF спецификации отправленное в Telegram."""
     user_id = update.effective_user.id
-    model = extracted["model"]
-    parts = extracted["parts"]
-    order_num = extracted.get("order_num", "N/A")
-    client_name = extracted.get("client_name", "Unknown")
-    has_data = check_column_has_data(model)
-    if has_data:
-        pending_confirmations[user_id] = {"model": model, "parts": parts, "order_num": order_num, "client_name": client_name}
+
+    # Проверяем есть ли ожидающие данные заказа
+    if user_id not in pending_photo:
         await update.message.reply_text(
-            f"⚠️ Column *{model}* already has data.\n\nFound *{len(parts)} parts*.\n\nReply *YES* to overwrite or *NO* to cancel.",
+            "📋 Please send the order details first as text message:\n"
+            "Format: `ORDER_NUMBER CLIENT_NAME`\n"
+            "Example: `2755 Bailey`",
             parse_mode="Markdown"
         )
-    else:
-        await update.message.reply_text(f"✅ Found *{order_num}* — {client_name} | *{model}* | *{len(parts)} parts*\nWriting to LIST sheet...", parse_mode="Markdown")
-        result = write_to_list_sheet(model, parts)
-        skipped_text = ""
-        if result['skipped_list']:
-            skipped_text = "\n\n⚠️ *Not found:*\n" + "\n".join(f"• {s}" for s in result['skipped_list'])
+        return
+
+    order_data = pending_photo.pop(user_id)
+    order_num = order_data["order_num"]
+    client_name = order_data["client_name"]
+
+    await update.message.reply_text("🔍 Reading specification image...")
+
+    try:
+        # Берём фото максимального размера
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
+
+        # Извлекаем модель через Claude Vision
+        result = extract_model_from_image(bytes(image_bytes))
+
+        if "error" in result:
+            await update.message.reply_text(f"❌ Could not read the image: {result['error']}")
+            return
+
+        model = result["model"]
+        logger.info(f"Extracted model from image: {model}")
+
         await update.message.reply_text(
-            f"✅ *Done!*\n📋 Model: *{model}*\n🔄 Matched: *{result['updated']}*\n🔍 By code: *{result['matched_by_code']}*\n⏭ Skipped: *{result['skipped']}*" + skipped_text,
+            f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n\n"
+            f"Generating Checks Sheet PDF...",
             parse_mode="Markdown"
         )
-        await update.message.reply_text("📄 Generating Checks Sheet PDF...")
+
         await send_checks_pdf(update, order_num, client_name, model)
 
+    except Exception as e:
+        logger.error(f"Photo processing error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     await update.message.reply_text("📄 PDF received. Reading the order specification...")
     try:
         file = await update.message.document.get_file()
         pdf_bytes = await file.download_as_bytearray()
         await update.message.reply_text("🔍 Extracting parts list from page 1...")
         extracted = extract_pdf_data_with_claude(bytes(pdf_bytes))
-        await process_extracted_order(update, extracted)
+        model = extracted["model"]
+        parts = extracted["parts"]
+        order_num = extracted.get("order_num", "N/A")
+        client_name = extracted.get("client_name", "Unknown")
+        has_data = check_column_has_data(model)
+        if has_data:
+            pending_confirmations[user_id] = {"model": model, "parts": parts, "order_num": order_num, "client_name": client_name}
+            await update.message.reply_text(
+                f"⚠️ Column *{model}* already has data.\n\nFound *{len(parts)} parts*.\n\nReply *YES* to overwrite or *NO* to cancel.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"✅ Found *{order_num}* — {client_name} | *{model}* | *{len(parts)} parts*\nWriting to LIST sheet...", parse_mode="Markdown")
+            result = write_to_list_sheet(model, parts)
+            skipped_text = ""
+            if result['skipped_list']:
+                skipped_text = "\n\n⚠️ *Not found:*\n" + "\n".join(f"• {s}" for s in result['skipped_list'])
+            await update.message.reply_text(
+                f"✅ *Done!*\n📋 Model: *{model}*\n🔄 Matched: *{result['updated']}*\n🔍 By code: *{result['matched_by_code']}*\n⏭ Skipped: *{result['skipped']}*" + skipped_text,
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text("📄 Generating Checks Sheet PDF...")
+            await send_checks_pdf(update, order_num, client_name, model)
     except Exception as e:
         logger.error(f"PDF processing error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in awaiting_order_photo:
-        await update.message.reply_text(
-            '📸 Got a photo, but I need you to tap "🆕 New Order" first so I know this is an order screenshot.',
-            reply_markup=MAIN_MENU
-        )
-        return
-    awaiting_order_photo.discard(user_id)
-    await update.message.reply_text("📸 Screenshot received. Reading the order specification...")
-    try:
-        photo = update.message.photo[-1]  # самое высокое разрешение
-        file = await photo.get_file()
-        image_bytes = await file.download_as_bytearray()
-        await update.message.reply_text("🔍 Extracting parts list...")
-        extracted = extract_image_data_with_claude(bytes(image_bytes))
-        await process_extracted_order(update, extracted)
-    except Exception as e:
-        logger.error(f"Photo processing error: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 def extract_pdf_data_with_claude(pdf_bytes):
@@ -407,33 +471,6 @@ def extract_pdf_data_with_claude(pdf_bytes):
 2. Client name (e.g. "Spicer")
 3. Greenhouse model - ONLY size + EX/EX2 suffix, no other words. E.g. "12x20EX SHD" → "12x20EX"
 4. All parts: ITEM, SIZE/CODE, QUANT.
-
-Return ONLY valid JSON:
-{"order_num": "2699", "client_name": "Spicer", "model": "12x20EX", "parts": [{"item": "BASEWALL", "size_code": "5'-7 1/2\\"", "quantity": 2}]}"""}
-        ]}]
-    )
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
-
-def extract_image_data_with_claude(image_bytes):
-    """Аналог extract_pdf_data_with_claude, но для скриншота (фото) заказа."""
-    image_base64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    response = claude_client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
-            {"type": "text", "text": """This is a screenshot of an order specification (page 1). Extract:
-1. Order number (e.g. "2699")
-2. Client name (e.g. "Spicer")
-3. Greenhouse model - ONLY size + EX/EX2 suffix, no other words. E.g. "12x20EX SHD" → "12x20EX"
-4. All parts: ITEM, SIZE/CODE, QUANT.
-
-If the image is blurry or a value is unreadable, do your best guess but never invent parts that aren't visible.
 
 Return ONLY valid JSON:
 {"order_num": "2699", "client_name": "Spicer", "model": "12x20EX", "parts": [{"item": "BASEWALL", "size_code": "5'-7 1/2\\"", "quantity": 2}]}"""}
@@ -463,13 +500,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Message from {user_name}: {message_text}")
 
-    # Нажата кнопка "🆕 New Order"
-    if message_text == "🆕 New Order":
-        awaiting_order_photo.add(user_id)
-        await update.message.reply_text("📸 Please send a screenshot of the order specification (page 1).")
+    # Обработка NEW_ORDER от Make (на случай если всё же придёт через Telegram)
+    # Проверяем формат "НОМЕР ИМЯ" (напр. "2755 Bailey") — ожидание фото
+    order_cmd = re.match(r'^(\d{3,6})\s+([A-Za-z][A-Za-z0-9\s-]{1,30})$', message_text.strip())
+    if order_cmd and user_id not in pending_confirmations:
+        order_num_cmd = order_cmd.group(1).strip()
+        client_name_cmd = order_cmd.group(2).strip()
+        pending_photo[user_id] = {"order_num": order_num_cmd, "client_name": client_name_cmd}
+        await update.message.reply_text(
+            f"✅ Order *{order_num_cmd}* — *{client_name_cmd}* saved.\n\n"
+            f"Now send a photo of the PDF specification (page 1 with the parts table).",
+            parse_mode="Markdown"
+        )
         return
 
-    # Обработка NEW_ORDER от Make (на случай если всё же придёт через Telegram)
     order_data = parse_new_order_message(message_text)
     if order_data:
         order_num = order_data["order_num"]
@@ -533,7 +577,6 @@ def main():
     app = Application.builder().token(token).build()
     telegram_app_ref = app
 
-    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
