@@ -9,8 +9,8 @@ import threading
 import queue
 from datetime import datetime
 from flask import Flask, request, jsonify
-from telegram import Update, Bot
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, CallbackQueryHandler
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
@@ -563,6 +563,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Claude error: {e}")
         await update.message.reply_text("Sorry, I'm having trouble right now.")
 
+# ─── BUTTON MENU ──────────────────────────────────────────────────────────────
+
+# Главное меню — 4 кнопки
+MAIN_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔧 Action", callback_data="menu_action")],
+    [InlineKeyboardButton("ℹ️ Info", callback_data="menu_info")],
+    [InlineKeyboardButton("📦 Request", callback_data="menu_request")],
+    [InlineKeyboardButton("🚚 Shipped", callback_data="menu_shipped")],
+])
+
+# Подменю кнопки Action — 3 кнопки
+ACTION_SUBMENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🟢 Пришёл на работу", callback_data="action_checkin")],
+    [InlineKeyboardButton("🔨 Изготовил", callback_data="action_produced")],
+    [InlineKeyboardButton("🔴 Ушёл с работы", callback_data="action_checkout")],
+    [InlineKeyboardButton("⬅️ Назад", callback_data="menu_back")],
+])
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start — показывает главное меню с 4 кнопками."""
+    await update.message.reply_text(
+        "👋 CBG Manager — main menu:",
+        reply_markup=MAIN_MENU
+    )
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия на все inline-кнопки."""
+    query = update.callback_query
+    await query.answer()  # убирает "часики" на кнопке в Telegram
+    data = query.data
+
+    if data == "menu_action":
+        await query.edit_message_text("🔧 Action — choose:", reply_markup=ACTION_SUBMENU)
+
+    elif data == "menu_back":
+        await query.edit_message_text("👋 CBG Manager — main menu:", reply_markup=MAIN_MENU)
+
+    elif data == "menu_info":
+        await query.edit_message_text("ℹ️ Info — 🚧 in development (coming next).")
+
+    elif data == "menu_request":
+        await query.edit_message_text("📦 Request — 🚧 in development (coming next).")
+
+    elif data == "menu_shipped":
+        await query.edit_message_text("🚚 Shipped — 🚧 in development (coming next).")
+
+    elif data == "action_checkin":
+        await query.edit_message_text("🟢 Check-in — 🚧 in development (coming next).")
+
+    elif data == "action_produced":
+        await query.edit_message_text("🔨 Produced — 🚧 in development (coming next).")
+
+    elif data == "action_checkout":
+        await query.edit_message_text("🔴 Check-out — 🚧 in development (coming next).")
+
+
 def run_flask():
     port = int(os.environ.get("FLASK_PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
@@ -577,6 +633,8 @@ def main():
     app = Application.builder().token(token).build()
     telegram_app_ref = app
 
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
