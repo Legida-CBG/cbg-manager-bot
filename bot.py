@@ -329,14 +329,15 @@ def parse_new_order_message(text: str):
 def extract_model_from_image(image_bytes: bytes) -> dict:
     """
     Отправляет фото PDF спецификации в Claude Vision.
-    Возвращает {"model": "10x18EX"} или {"error": "..."}
+    Возвращает {"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false}
+    или {"error": "..."}
     """
     import base64
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
     response = claude_client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=300,
+        max_tokens=400,
         messages=[{
             "role": "user",
             "content": [
@@ -361,8 +362,17 @@ Rules for model name:
 - If no PORTICO → no suffix (e.g. 10x18)
 - Use only numbers and x, no spaces or apostrophes
 
+Also look at the door line items in the table (ITEM column):
+- Count total FRONT doors: sum quantities of any row referring to a front door
+  (e.g. "REGULAR FRONT DOOR", "ADDITIONAL FRONT DOOR", "DUTCH FRONT DOOR",
+  "DUTCH FRONT DOUBLE DOORS", "DOOR (SINGLE)" if it is on the front end, etc.)
+- Count total BACK doors: sum quantities of any row referring to a back door
+  (e.g. "DUTCH BACK DOUBLE DOORS", "REGULAR BACK DOOR", "ADDITIONAL BACK DOOR", etc.)
+- Check if the word "WINDOW" appears anywhere in the ITEM or description column
+  (e.g. "DOUBLE DUTCH WINDOW UPGRADE").
+
 Return ONLY valid JSON, nothing else:
-{"model": "10x18EX"}"""
+{"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false}"""
                 }
             ]
         }]
@@ -375,6 +385,118 @@ Return ONLY valid JSON, nothing else:
             raw = raw[4:]
     raw = raw.strip()
     return json.loads(raw)
+
+
+def get_greenhouse_width(model: str):
+    """Извлекает ширину теплицы из названия модели, напр. '12x18EX' -> 12"""
+    m = re.match(r'(\d+)\s*[xX]\s*\d+', model.strip())
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _replace_code_prefix(code: str, old: str, new: str) -> str:
+    """Заменяет old на new внутри code (без учёта регистра), сохраняя остальной текст."""
+    idx = code.upper().find(old.upper())
+    if idx == -1:
+        return code
+    return code[:idx] + new + code[idx + len(old):]
+
+
+def _double_quant(quant):
+    """Удваивает количество (quant может быть строкой типа '2' или '2.5')."""
+    try:
+        if '.' in str(quant):
+            val = float(quant) * 2
+            return str(val) if val != int(val) else str(int(val))
+        return str(int(quant) * 2)
+    except (ValueError, TypeError):
+        return quant
+
+
+def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool) -> list:
+    """
+    Применяет замены GW / EP / Lintel Beam деталей на основе конфигурации дверей.
+
+    rows: список {"item":, "size_code":, "quant":} из LIST sheet
+    width: ширина теплицы (8, 10, 12, 14) или None
+    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam)
+    ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет только на GW/EP
+    window: bool — есть окно (авто-определено по фото); влияет только на Lintel Beam
+    """
+    result = []
+    for row in rows:
+        item = row["item"]
+        code = row["size_code"]
+        quant = row["quant"]
+        code_clean = code.replace(" ", "").upper()
+        new_code = code
+        new_quant = quant
+        skip = False
+
+        # ---- GW parts — только модели шириной 12' ----
+        if width == 12 and code_clean.startswith("GW47"):
+            if ea or door_config == "double":
+                new_code = _replace_code_prefix(code, "GW47", "GW35")
+
+        elif width == 12 and code_clean.startswith("GW36"):
+            if ea:
+                skip = True  # GW36 удаляется полностью, GW60 НЕ добавляется
+            elif door_config == "double":
+                new_code = _replace_code_prefix(code, "GW36", "GW60")
+
+        # ---- EP parts — модели шириной 10' ----
+        elif width == 10 and code_clean.startswith("EP70"):
+            is_ld_rd = "LD" in code_clean or "RD" in code_clean
+            if ea:
+                if is_ld_rd:
+                    new_code = _replace_code_prefix(code, "EP70", "EP66")
+                    new_quant = _double_quant(quant)
+                else:
+                    skip = True  # EP70-L/R удаляется полностью
+            elif door_config == "double":
+                new_code = _replace_code_prefix(code, "EP70", "EP66")
+
+        # ---- EP parts — модели шириной 12' / 14' ----
+        elif width in (12, 14) and code_clean.startswith("EP76"):
+            is_ld_rd = "LD" in code_clean or "RD" in code_clean
+            if ea:
+                if is_ld_rd:
+                    new_code = _replace_code_prefix(code, "EP76", "EP70")
+                    new_quant = _double_quant(quant)
+                else:
+                    skip = True  # EP76-L/R удаляется полностью
+            elif door_config == "double":
+                new_code = _replace_code_prefix(code, "EP76", "EP70")
+
+        # ---- Lintel Beam — модели шириной 12' / 14' ----
+        elif width in (12, 14) and code_clean == "LBS-1":
+            if door_config == "double":
+                new_code = "LB D-1"
+
+        elif width in (12, 14) and code_clean == "LBS-2":
+            if door_config == "double" and window:
+                new_code = "LB D-1N"
+            elif door_config == "double" and not window:
+                new_code = "LB D-2"
+            elif door_config == "single" and window:
+                new_code = "LB S-1N"
+            # single, без окна — без изменений
+
+        # ---- Lintel Beam — модели шириной 8' / 10' (нет Double-варианта) ----
+        elif width in (8, 10) and code_clean == "LBS-2":
+            if window:
+                new_code = "LB S-1N"
+            # LB S-1 на 8'/10' никогда не меняется
+
+        if skip:
+            continue
+        new_row = dict(row)
+        new_row["size_code"] = new_code
+        new_row["quant"] = new_quant
+        result.append(new_row)
+
+    return result
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,18 +534,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         model = result["model"]
-        logger.info(f"Extracted model from image: {model} | door_config={door_config}")
+        front_doors = result.get("front_doors", 1)
+        back_doors = result.get("back_doors", 1)
+        window = bool(result.get("window", False))
+        ea = front_doors > 1 and back_doors > 1
+        width = get_greenhouse_width(model)
+
+        logger.info(
+            f"Extracted model from image: {model} | door_config={door_config} | "
+            f"front_doors={front_doors} | back_doors={back_doors} | ea={ea} | window={window}"
+        )
+
+        config_summary = "EA (double both sides)" if ea else door_config.capitalize()
+        window_summary = " + Window" if window else ""
 
         await update.message.reply_text(
             f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
-            f"🚪 *Lintel Beam:* {door_config.capitalize()}\n\n"
+            f"🚪 *Door config:* {config_summary}{window_summary}\n\n"
             f"Generating Checks Sheet PDF...",
             parse_mode="Markdown"
         )
 
-        # TODO (следующий шаг): применить замены GW/EP/Lintel Beam на основе door_config,
-        # а также автоопределение EA и WINDOW, перед генерацией PDF.
-        await send_checks_pdf(update, order_num, client_name, model)
+        rows = get_list_rows_for_model(model)
+        if not rows:
+            await update.message.reply_text(f"⚠️ Model *{model}* not found in LIST sheet.", parse_mode="Markdown")
+            return
+        rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
+
+        pdf_bytes = generate_checks_pdf(order_num=order_num, client_name=client_name, model=model, rows=rows)
+        filename = f"{order_num}_{client_name}_{model}_Checks.pdf"
+        await update.message.reply_document(
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption=f"📋 *Checks Sheet* — {order_num} {client_name} | {model}\n_{len(rows)} parts_",
+            parse_mode="Markdown"
+        )
 
     except Exception as e:
         logger.error(f"Photo processing error: {e}")
