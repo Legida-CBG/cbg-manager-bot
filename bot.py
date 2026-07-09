@@ -26,6 +26,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 pending_confirmations = {}
 pending_photo = {}  # user_id → {order_num, client_name} ожидают фото
+pending_door_config = {}  # user_id → {order_num, client_name} ожидают ответа Single/Double
 
 flask_app = Flask(__name__)
 telegram_app_ref = None  # глобальная ссылка на Application
@@ -393,6 +394,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_data = pending_photo.pop(user_id)
     order_num = order_data["order_num"]
     client_name = order_data["client_name"]
+    door_config = order_data.get("door_config", "single")
 
     await update.message.reply_text("🔍 Reading specification image...")
 
@@ -410,14 +412,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         model = result["model"]
-        logger.info(f"Extracted model from image: {model}")
+        logger.info(f"Extracted model from image: {model} | door_config={door_config}")
 
         await update.message.reply_text(
-            f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n\n"
+            f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
+            f"🚪 *Lintel Beam:* {door_config.capitalize()}\n\n"
             f"Generating Checks Sheet PDF...",
             parse_mode="Markdown"
         )
 
+        # TODO (следующий шаг): применить замены GW/EP/Lintel Beam на основе door_config,
+        # а также автоопределение EA и WINDOW, перед генерацией PDF.
         await send_checks_pdf(update, order_num, client_name, model)
 
     except Exception as e:
@@ -501,16 +506,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from {user_name}: {message_text}")
 
     # Обработка NEW_ORDER от Make (на случай если всё же придёт через Telegram)
-    # Проверяем формат "НОМЕР ИМЯ" (напр. "2755 Bailey") — ожидание фото
+    # Проверяем формат "НОМЕР ИМЯ" (напр. "2755 Bailey") — теперь спрашиваем Single/Double перед фото
     order_cmd = re.match(r'^(\d{3,6})\s+([A-Za-z][A-Za-z0-9\s-]{1,30})$', message_text.strip())
     if order_cmd and user_id not in pending_confirmations:
         order_num_cmd = order_cmd.group(1).strip()
         client_name_cmd = order_cmd.group(2).strip()
-        pending_photo[user_id] = {"order_num": order_num_cmd, "client_name": client_name_cmd}
+        pending_door_config[user_id] = {"order_num": order_num_cmd, "client_name": client_name_cmd}
         await update.message.reply_text(
-            f"✅ Order *{order_num_cmd}* — *{client_name_cmd}* saved.\n\n"
-            f"Now send a photo of the PDF specification (page 1 with the parts table).",
+            f"✅ Order *{order_num_cmd}* — *{client_name_cmd}* saved.",
             parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            "Is Lintel Beam double in this order?",
+            reply_markup=DOOR_CONFIG_KEYBOARD
         )
         return
 
@@ -581,6 +589,12 @@ ACTION_SUBMENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("⬅️ Назад", callback_data="menu_back")],
 ])
 
+# Кнопки Single/Double для Lintel Beam (задаются перед запросом фото спецификации)
+DOOR_CONFIG_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Double", callback_data="doorcfg_double")],
+    [InlineKeyboardButton("Single", callback_data="doorcfg_single")],
+])
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start — показывает главное меню с 4 кнопками."""
     await update.message.reply_text(
@@ -593,6 +607,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()  # убирает "часики" на кнопке в Telegram
     data = query.data
+    user_id = query.from_user.id
 
     if data == "menu_action":
         await query.edit_message_text("🔧 Action — choose:", reply_markup=ACTION_SUBMENU)
@@ -617,6 +632,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action_checkout":
         await query.edit_message_text("🔴 Check-out — 🚧 in development (coming next).")
+
+    elif data in ("doorcfg_double", "doorcfg_single"):
+        if user_id not in pending_door_config:
+            await query.edit_message_text(
+                "⚠️ No pending order found. Please send the order details again:\n"
+                "Format: `ORDER_NUMBER CLIENT_NAME`",
+                parse_mode="Markdown"
+            )
+            return
+        order_info = pending_door_config.pop(user_id)
+        door_config = "double" if data == "doorcfg_double" else "single"
+        pending_photo[user_id] = {
+            "order_num": order_info["order_num"],
+            "client_name": order_info["client_name"],
+            "door_config": door_config
+        }
+        await query.edit_message_text(
+            f"🚪 Lintel Beam: *{door_config.capitalize()}*\n\n"
+            f"Now send a photo of the PDF specification (page 1 with the parts table).",
+            parse_mode="Markdown"
+        )
 
 
 def run_flask():
