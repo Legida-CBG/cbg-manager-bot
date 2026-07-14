@@ -499,6 +499,80 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
     return result
 
 
+def _fmt_qty(q):
+    """Форматирует число как строку — целое без .0, иначе как есть."""
+    return str(int(q)) if q == int(q) else str(q)
+
+
+def recalculate_lintel_posts(rows: list) -> list:
+    """
+    Пересчитывает количество Lintel Posts (LP-T / LP-S) на основе итоговых
+    кодов Lintel Beam (после apply_door_config_substitutions).
+
+    Правило:
+    - Front балка: 1 Lintel Post
+    - Back балка: 1 Lintel Post
+    - Midspan балка: 2 Lintel Post на каждую балку
+    - Если код балки начинается с "LB D" (double) -> Lintel Post Tall (LP-T)
+    - Если код балки начинается с "LB S" (single) -> Lintel Post Short (LP-S)
+    """
+    lp_t_total = 0
+    lp_s_total = 0
+    has_lintel_beam = False
+
+    for row in rows:
+        item_upper = row["item"].upper()
+        if "LINTEL BEAM" not in item_upper:
+            continue
+        has_lintel_beam = True
+
+        code_clean = row["size_code"].replace(" ", "").upper()
+        try:
+            qty = float(row["quant"])
+        except (ValueError, TypeError):
+            qty = 1
+
+        multiplier = 2 if "MIDSPAN" in item_upper else 1
+
+        if code_clean.startswith("LBD"):
+            lp_t_total += qty * multiplier
+        elif code_clean.startswith("LBS"):
+            lp_s_total += qty * multiplier
+
+    if not has_lintel_beam:
+        return rows
+
+    result = []
+    lp_t_found = False
+    lp_s_found = False
+
+    for row in rows:
+        code_clean = row["size_code"].replace(" ", "").upper()
+        if code_clean == "LP-T":
+            lp_t_found = True
+            if lp_t_total <= 0:
+                continue
+            new_row = dict(row)
+            new_row["quant"] = _fmt_qty(lp_t_total)
+            result.append(new_row)
+        elif code_clean == "LP-S":
+            lp_s_found = True
+            if lp_s_total <= 0:
+                continue
+            new_row = dict(row)
+            new_row["quant"] = _fmt_qty(lp_s_total)
+            result.append(new_row)
+        else:
+            result.append(row)
+
+    if not lp_t_found and lp_t_total > 0:
+        result.append({"item": "LINTEL POST - TALL", "size_code": "LP-T", "quant": _fmt_qty(lp_t_total)})
+    if not lp_s_found and lp_s_total > 0:
+        result.append({"item": "LINTEL POST - SHORT", "size_code": "LP-S", "quant": _fmt_qty(lp_s_total)})
+
+    return result
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает фото PDF спецификации отправленное в Telegram."""
     user_id = update.effective_user.id
@@ -560,6 +634,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Model *{model}* not found in LIST sheet.", parse_mode="Markdown")
             return
         rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
+        rows = recalculate_lintel_posts(rows)
 
         pdf_bytes = generate_checks_pdf(order_num=order_num, client_name=client_name, model=model, rows=rows)
         filename = f"{order_num}_{client_name}_{model}_Checks.pdf"
