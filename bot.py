@@ -418,13 +418,13 @@ def _double_quant(quant):
 
 def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool) -> list:
     """
-    Применяет замены GW / EP / Lintel Beam / GBX деталей на основе конфигурации дверей.
+    Применяет замены GW / EP / Lintel Beam / GBX / Gable Sills деталей на основе конфигурации дверей.
 
     rows: список {"item":, "size_code":, "quant":} из LIST sheet
     width: ширина теплицы (8, 10, 12, 14) или None
-    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX)
-    ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет только на GW/EP
-    window: bool — есть окно (авто-определено по фото); влияет только на Lintel Beam
+    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Sills)
+    ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет только на GW/EP/Gable Center Sills
+    window: bool — есть окно (авто-определено по фото); влияет только на Lintel Beam / Gable Center Sills
     """
     result = []
     for row in rows:
@@ -498,6 +498,33 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
             if door_config == "double":
                 new_code = _replace_code_prefix(code, "GBX-S", "GBX-T")
             # single — без изменений, остаётся GBX-S
+
+        # ---- Gable Corner Sills — только модели шириной 12' меняются ----
+        # EA НЕ влияет на Corner Sills. На 8'/10'/14' код уже верный в LIST — не трогаем.
+        elif width == 12 and code_clean.startswith("GS47"):
+            if door_config == "double":
+                new_code = _replace_code_prefix(code, "GS47", "GS35")
+            # single — без изменений, остаётся GS47-L/R
+
+        # ---- Gable Center Sills — GS36-N / GS60-N (+ игнорируем "мусорные" WN-строки из LIST) ----
+        elif code_clean in ("GS36-N", "GS60-N", "GS36-WN", "GS60-WN"):
+            if code_clean in ("GS36-WN", "GS60-WN"):
+                # Это вручную (ошибочно) внесённые строки для будущего складского учёта —
+                # никогда не используем их как источник данных или цель замены.
+                skip = True
+            elif ea:
+                # При EA (double с обеих сторон) Gable Center Sills убираются полностью,
+                # независимо от ширины теплицы.
+                skip = True
+            else:
+                if width == 12 and door_config == "double":
+                    new_code = _replace_code_prefix(code, "GS36", "GS60")
+                # 8'/10': всегда GS36-N (без изменений)
+                # 14': всегда double, код в LIST уже GS60-N (без изменений)
+                # Правило окна (W) — применяется ПОСЛЕДНИМ шагом, только если
+                # итоговый код заканчивается на "-N"
+                if window and new_code.upper().replace(" ", "").endswith("-N"):
+                    new_code = new_code[:-1] + "WN"
 
         if skip:
             continue
