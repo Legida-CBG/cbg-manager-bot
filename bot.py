@@ -25,8 +25,10 @@ SPREADSHEET_ID = "1NNb7CeNl9gU5TXbJTGvx5RsMMvxgPY39J4nWPFSprBI"
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 pending_confirmations = {}
-pending_photo = {}  # user_id → {order_num, client_name} ожидают фото
+pending_photo = {}  # user_id → {order_num, client_name, door_config} ожидают фото
 pending_door_config = {}  # user_id → {order_num, client_name} ожидают ответа Single/Double
+pending_pdf_choice = {}  # user_id → {order_num, client_name, door_config} ожидают ответа "есть ли PDF"
+pending_manual_entry = {}  # user_id → {order_num, client_name, door_config, step, ...} ручной ввод без фото
 
 flask_app = Flask(__name__)
 telegram_app_ref = None  # глобальная ссылка на Application
@@ -416,11 +418,11 @@ def _double_quant(quant):
 
 def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool) -> list:
     """
-    Применяет замены GW / EP / Lintel Beam / GBX деталей на основе конфигурации дверей.
+    Применяет замены GW / EP / Lintel Beam деталей на основе конфигурации дверей.
 
     rows: список {"item":, "size_code":, "quant":} из LIST sheet
     width: ширина теплицы (8, 10, 12, 14) или None
-    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX)
+    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam)
     ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет только на GW/EP
     window: bool — есть окно (авто-определено по фото); влияет только на Lintel Beam
     """
@@ -489,20 +491,86 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
                 new_code = "LB S-1N"
             # LB S-1 на 8'/10' никогда не меняется
 
-        # ---- EX Gable Batton (GBX) — модели шириной 12' / 14' ----
-        # EA НЕ влияет на это правило — важен только ответ Single/Double.
-        # На 8'/10' GBX всегда остаётся GBX-S (сюда не заходит).
-        elif width in (12, 14) and code_clean.startswith("GBX-S"):
-            if door_config == "double":
-                new_code = _replace_code_prefix(code, "GBX-S", "GBX-T")
-            # single — без изменений, остаётся GBX-S
-
         if skip:
             continue
         new_row = dict(row)
         new_row["size_code"] = new_code
         new_row["quant"] = new_quant
         result.append(new_row)
+
+    return result
+
+
+def _fmt_qty(q):
+    """Форматирует число как строку — целое без .0, иначе как есть."""
+    return str(int(q)) if q == int(q) else str(q)
+
+
+def recalculate_lintel_posts(rows: list) -> list:
+    """
+    Пересчитывает количество Lintel Posts (LP-T / LP-S) на основе итоговых
+    кодов Lintel Beam (после apply_door_config_substitutions).
+
+    Правило:
+    - Front балка: 1 Lintel Post
+    - Back балка: 1 Lintel Post
+    - Midspan балка: 2 Lintel Post на каждую балку
+    - Если код балки начинается с "LB D" (double) -> Lintel Post Tall (LP-T)
+    - Если код балки начинается с "LB S" (single) -> Lintel Post Short (LP-S)
+    """
+    lp_t_total = 0
+    lp_s_total = 0
+    has_lintel_beam = False
+
+    for row in rows:
+        item_upper = row["item"].upper()
+        if "LINTEL BEAM" not in item_upper:
+            continue
+        has_lintel_beam = True
+
+        code_clean = row["size_code"].replace(" ", "").upper()
+        try:
+            qty = float(row["quant"])
+        except (ValueError, TypeError):
+            qty = 1
+
+        multiplier = 2 if "MIDSPAN" in item_upper else 1
+
+        if code_clean.startswith("LBD"):
+            lp_t_total += qty * multiplier
+        elif code_clean.startswith("LBS"):
+            lp_s_total += qty * multiplier
+
+    if not has_lintel_beam:
+        return rows
+
+    result = []
+    lp_t_found = False
+    lp_s_found = False
+
+    for row in rows:
+        code_clean = row["size_code"].replace(" ", "").upper()
+        if code_clean == "LP-T":
+            lp_t_found = True
+            if lp_t_total <= 0:
+                continue
+            new_row = dict(row)
+            new_row["quant"] = _fmt_qty(lp_t_total)
+            result.append(new_row)
+        elif code_clean == "LP-S":
+            lp_s_found = True
+            if lp_s_total <= 0:
+                continue
+            new_row = dict(row)
+            new_row["quant"] = _fmt_qty(lp_s_total)
+            result.append(new_row)
+        else:
+            result.append(row)
+
+    if not lp_t_found and lp_t_total > 0:
+        result.append({"item": "LINTEL POST - TALL", "size_code": "LP-T", "quant": _fmt_qty(lp_t_total)})
+    if not lp_s_found and lp_s_total > 0:
+        result.append({"item": "LINTEL POST - SHORT", "size_code": "LP-S", "quant": _fmt_qty(lp_s_total)})
 
     return result
 
@@ -568,6 +636,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Model *{model}* not found in LIST sheet.", parse_mode="Markdown")
             return
         rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
+        rows = recalculate_lintel_posts(rows)
 
         pdf_bytes = generate_checks_pdf(order_num=order_num, client_name=client_name, model=model, rows=rows)
         filename = f"{order_num}_{client_name}_{model}_Checks.pdf"
@@ -657,6 +726,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_date = datetime.now().strftime("%B %d, %Y")
 
     logger.info(f"Message from {user_name}: {message_text}")
+
+    # Ручной ввод размера теплицы (когда нет PDF)
+    if user_id in pending_manual_entry and pending_manual_entry[user_id].get("step") == "await_size":
+        size_match = re.match(r'^(\d+)\s*[xX]\s*(\d+)$', message_text.strip())
+        if not size_match:
+            await update.message.reply_text(
+                "⚠️ Please enter the size in format WIDTHxLENGTH, e.g. `14x24`",
+                parse_mode="Markdown"
+            )
+            return
+        pending_manual_entry[user_id]["width"] = int(size_match.group(1))
+        pending_manual_entry[user_id]["length"] = int(size_match.group(2))
+        pending_manual_entry[user_id]["step"] = "await_suffix"
+        await update.message.reply_text(
+            "Does this model have an EX suffix?",
+            reply_markup=SUFFIX_KEYBOARD
+        )
+        return
 
     # Обработка NEW_ORDER от Make (на случай если всё же придёт через Telegram)
     # Проверяем формат "НОМЕР ИМЯ" (напр. "2755 Bailey") — теперь спрашиваем Single/Double перед фото
@@ -748,6 +835,31 @@ DOOR_CONFIG_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("Single", callback_data="doorcfg_single")],
 ])
 
+# Есть ли PDF спецификация?
+HAS_PDF_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Yes", callback_data="haspdf_yes")],
+    [InlineKeyboardButton("No", callback_data="haspdf_no")],
+])
+
+# Суффикс модели (ручной ввод)
+SUFFIX_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("None", callback_data="suffix_none")],
+    [InlineKeyboardButton("EX", callback_data="suffix_ex")],
+    [InlineKeyboardButton("EX2", callback_data="suffix_ex2")],
+])
+
+# Есть ли окно (ручной ввод)
+WINDOW_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Yes", callback_data="window_yes")],
+    [InlineKeyboardButton("No", callback_data="window_no")],
+])
+
+# EA — двери с двух сторон (ручной ввод)
+EA_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Yes", callback_data="ea_yes")],
+    [InlineKeyboardButton("No", callback_data="ea_no")],
+])
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start — показывает главное меню с 4 кнопками."""
     await update.message.reply_text(
@@ -796,14 +908,105 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         order_info = pending_door_config.pop(user_id)
         door_config = "double" if data == "doorcfg_double" else "single"
-        pending_photo[user_id] = {
+        pending_pdf_choice[user_id] = {
             "order_num": order_info["order_num"],
             "client_name": order_info["client_name"],
             "door_config": door_config
         }
         await query.edit_message_text(
             f"🚪 Lintel Beam: *{door_config.capitalize()}*\n\n"
-            f"Now send a photo of the PDF specification (page 1 with the parts table).",
+            f"Do you have the PDF specification for this order?",
+            parse_mode="Markdown",
+            reply_markup=HAS_PDF_KEYBOARD
+        )
+
+    elif data in ("haspdf_yes", "haspdf_no"):
+        if user_id not in pending_pdf_choice:
+            await query.edit_message_text(
+                "⚠️ No pending order found. Please send the order details again:\n"
+                "Format: `ORDER_NUMBER CLIENT_NAME`",
+                parse_mode="Markdown"
+            )
+            return
+        order_info = pending_pdf_choice.pop(user_id)
+        if data == "haspdf_yes":
+            pending_photo[user_id] = order_info
+            await query.edit_message_text(
+                "Now send a photo of the PDF specification (page 1 with the parts table)."
+            )
+        else:
+            pending_manual_entry[user_id] = {
+                "order_num": order_info["order_num"],
+                "client_name": order_info["client_name"],
+                "door_config": order_info["door_config"],
+                "step": "await_size"
+            }
+            await query.edit_message_text(
+                "Please enter the greenhouse size as WIDTHxLENGTH (e.g. `14x24`)",
+                parse_mode="Markdown"
+            )
+
+    elif data in ("suffix_none", "suffix_ex", "suffix_ex2"):
+        if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_suffix":
+            return
+        suffix_map = {"suffix_none": "", "suffix_ex": "EX", "suffix_ex2": "EX2"}
+        pending_manual_entry[user_id]["suffix"] = suffix_map[data]
+        pending_manual_entry[user_id]["step"] = "await_window"
+        await query.edit_message_text(
+            "Is there a window in this order?",
+            reply_markup=WINDOW_KEYBOARD
+        )
+
+    elif data in ("window_yes", "window_no"):
+        if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_window":
+            return
+        pending_manual_entry[user_id]["window"] = (data == "window_yes")
+        pending_manual_entry[user_id]["step"] = "await_ea"
+        await query.edit_message_text(
+            "Is this EA — double doors on both sides (front AND back)?",
+            reply_markup=EA_KEYBOARD
+        )
+
+    elif data in ("ea_yes", "ea_no"):
+        if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_ea":
+            return
+        entry = pending_manual_entry.pop(user_id)
+        ea = (data == "ea_yes")
+        width = entry["width"]
+        length = entry["length"]
+        suffix = entry["suffix"]
+        window = entry["window"]
+        door_config = entry["door_config"]
+        order_num = entry["order_num"]
+        client_name = entry["client_name"]
+        model = f"{width}x{length}{suffix}"
+
+        await query.edit_message_text(
+            f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
+            f"🚪 *Door config:* {'EA (double both sides)' if ea else door_config.capitalize()}"
+            f"{' + Window' if window else ''}\n\n"
+            f"Generating Checks Sheet PDF...",
+            parse_mode="Markdown"
+        )
+
+        rows = get_list_rows_for_model(model)
+        if not rows:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"⚠️ Model *{model}* not found in LIST sheet.",
+                parse_mode="Markdown"
+            )
+            return
+        rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
+        rows = recalculate_lintel_posts(rows)
+
+        pdf_bytes = generate_checks_pdf(order_num=order_num, client_name=client_name, model=model, rows=rows)
+        filename = f"{order_num}_{client_name}_{model}_Checks.pdf"
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption=f"📋 *Checks Sheet* — {order_num} {client_name} | {model}\n_{len(rows)} parts_",
             parse_mode="Markdown"
         )
 
