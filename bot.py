@@ -65,6 +65,21 @@ WINDOW_CODE_TABLE = {
 }
 
 
+def _insert_window_row(rows: list, window_row: dict) -> list:
+    """
+    Вставляет строку окна (DUTCH WINDOW PIECES) в список деталей на правильную
+    позицию — сразу ПЕРЕД первой строкой Ridge Beam (между дверьми и Ridge Beam,
+    так как в LIST двери идут раньше Ridge Beam).
+    Если Ridge Beam не найден — добавляет в конец списка (запасной вариант).
+    """
+    for i, row in enumerate(rows):
+        if "RIDGE" in row["item"].upper():
+            rows.insert(i, window_row)
+            return rows
+    rows.append(window_row)
+    return rows
+
+
 def get_window_code(width, door_config: str, back_wall_height, window_double: bool):
     """
     Возвращает код детали "DUTCH WINDOW PIECES" (без суффикса " DW") или None,
@@ -297,7 +312,7 @@ async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, wi
         back_wall = (walls or {}).get("back")
         code = get_window_code(width, door_config, back_wall, window_double)
         if code:
-            rows.append({"item": "DUTCH WINDOW PIECES", "size_code": f"{code} DW", "quant": "1"})
+            rows = _insert_window_row(rows, {"item": "DUTCH WINDOW PIECES", "size_code": f"{code} DW", "quant": "1"})
         else:
             logger.warning(
                 f"No window code found for width={width}, door_config={door_config}, "
