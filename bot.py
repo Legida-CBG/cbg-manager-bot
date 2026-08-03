@@ -65,6 +65,104 @@ WINDOW_CODE_TABLE = {
 }
 
 
+# ─── ТАБЛИЦА МАРКИРОВКИ ДВЕРЕЙ (REGULAR / DUTCH) ─────────────────────────────
+# Ключ: (door_config, width) — door_config это Single/Double Lintel Beam,
+# которое жёстко определяет число створок двери (10x8'/10' => single, 14' => double,
+# 12' => как задано пользователем).
+# Значение: {"regular": код, "dutch": код}
+DOOR_CODE_TABLE = {
+    ("double", 14): {"regular": "2675R", "dutch": "2675DD"},
+    ("double", 12): {"regular": "26611R", "dutch": "26611DD"},
+    ("single", 12): {"regular": "3075R", "dutch": "3075DD"},
+    ("single", 10): {"regular": "30611R", "dutch": "30611DD"},
+    ("single", 8): {"regular": "3065R", "dutch": "3065DD"},
+}
+
+
+def get_door_code(width, door_config: str, style: str):
+    """
+    Возвращает код двери по (door_config, width, style) или None, если
+    комбинация не найдена (например неизвестная ширина).
+
+    door_config: "single" или "double" (совпадает с Lintel Beam конфигурацией)
+    style: "regular" или "dutch"
+    """
+    entry = DOOR_CODE_TABLE.get((door_config, width))
+    if entry is None:
+        return None
+    return entry.get(style)
+
+
+def build_door_rows(width, door_config: str, ea: bool, front_door_style: str, back_door_style: str = None) -> list:
+    """
+    Строит список строк (front дверь всегда, back дверь только если ea=True)
+    для вставки в итоговый список деталей.
+
+    Quantity: door_config == "double" -> "2", door_config == "single" -> "1"
+    (количество створок самой двери, а не количество дверных проёмов).
+    """
+    qty = "2" if door_config == "double" else "1"
+    rows = []
+
+    front_code = get_door_code(width, door_config, front_door_style)
+    if front_code:
+        label = "DUTCH" if front_door_style == "dutch" else "REGULAR"
+        size_label = "DOUBLE" if door_config == "double" else "SINGLE"
+        rows.append({
+            "item": f"{label} DOOR ({size_label}) - FRONT",
+            "size_code": front_code,
+            "quant": qty
+        })
+    else:
+        logger.warning(f"No front door code found for width={width}, door_config={door_config}, style={front_door_style}")
+
+    if ea:
+        style_back = back_door_style or front_door_style
+        back_code = get_door_code(width, door_config, style_back)
+        if back_code:
+            label = "DUTCH" if style_back == "dutch" else "REGULAR"
+            size_label = "DOUBLE" if door_config == "double" else "SINGLE"
+            rows.append({
+                "item": f"{label} DOOR ({size_label}) - BACK",
+                "size_code": back_code,
+                "quant": qty
+            })
+        else:
+            logger.warning(f"No back door code found for width={width}, door_config={door_config}, style={style_back}")
+
+    return rows
+
+
+def _insert_door_rows(rows: list, door_rows: list) -> list:
+    """
+    Вставляет строки дверей ПОСЛЕ Lintel Posts (LP-T / LP-S) и ПЕРЕД окном/Ridge Beam.
+    Если Lintel Post не найден — вставляет перед первой строкой Ridge Beam (запасной
+    вариант), либо в конец списка, если и Ridge Beam не найден.
+    """
+    if not door_rows:
+        return rows
+
+    insert_idx = None
+    for i, row in enumerate(rows):
+        code_clean = row["size_code"].replace(" ", "").upper()
+        if code_clean in ("LP-T", "LP-S"):
+            insert_idx = i + 1  # после последнего найденного Lintel Post
+
+    if insert_idx is None:
+        for i, row in enumerate(rows):
+            if "RIDGE" in row["item"].upper():
+                insert_idx = i
+                break
+
+    if insert_idx is None:
+        insert_idx = len(rows)
+
+    for offset, door_row in enumerate(door_rows):
+        rows.insert(insert_idx + offset, door_row)
+
+    return rows
+
+
 def _insert_window_row(rows: list, window_row: dict) -> list:
     """
     Вставляет строку окна (DUTCH WINDOW PIECES) в список деталей на правильную
@@ -300,13 +398,18 @@ async def send_checks_pdf(update, order_num, client_name, model):
 
 
 async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, width,
-                             door_config, walls, window, window_double, ea, rows):
+                             door_config, walls, window, window_double, ea,
+                             front_door_style, back_door_style, rows):
     """
     Общая финальная функция: применяет замены дверной конфигурации, пересчитывает
-    Lintel Posts, добавляет строку DUTCH WINDOW PIECES (если окно есть) и отправляет PDF.
+    Lintel Posts, вставляет строки дверей (front всегда, back если EA), добавляет
+    строку DUTCH WINDOW PIECES (если окно есть) и отправляет PDF.
     """
     rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
     rows = recalculate_lintel_posts(rows)
+
+    door_rows = build_door_rows(width, door_config, ea, front_door_style, back_door_style)
+    rows = _insert_door_rows(rows, door_rows)
 
     if window:
         back_wall = (walls or {}).get("back")
@@ -429,7 +532,8 @@ def parse_new_order_message(text: str):
 def extract_model_from_image(image_bytes: bytes) -> dict:
     """
     Отправляет фото PDF спецификации в Claude Vision.
-    Возвращает {"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false}
+    Возвращает {"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false,
+                "front_door_style": "regular", "back_door_style": "dutch"}
     или {"error": "..."}
     """
     import base64
@@ -437,7 +541,7 @@ def extract_model_from_image(image_bytes: bytes) -> dict:
 
     response = claude_client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=400,
+        max_tokens=500,
         messages=[{
             "role": "user",
             "content": [
@@ -471,8 +575,14 @@ Also look at the door line items in the table (ITEM column):
 - Check if the word "WINDOW" appears anywhere in the ITEM or description column
   (e.g. "DOUBLE DUTCH WINDOW UPGRADE").
 
+Also determine the DOOR STYLE for front and back doors:
+- If the front door row contains the word "DUTCH" → front_door_style = "dutch"
+- Otherwise (e.g. "REGULAR", or no style word mentioned) → front_door_style = "regular"
+- If there is a back door row: same logic for back_door_style ("dutch" if it contains
+  "DUTCH", otherwise "regular"). If there is no back door at all, set back_door_style to null.
+
 Return ONLY valid JSON, nothing else:
-{"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false}"""
+{"model": "10x18EX", "front_doors": 1, "back_doors": 2, "window": false, "front_door_style": "regular", "back_door_style": null}"""
                 }
             ]
         }]
@@ -750,17 +860,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ea = front_doors > 1 and back_doors > 1
         width = get_greenhouse_width(model)
 
+        # Стиль дверей (Regular/Dutch), определённый Claude Vision.
+        # Если front стиль не распознан — по умолчанию считаем "regular".
+        front_door_style = (result.get("front_door_style") or "regular").lower()
+        if front_door_style not in ("regular", "dutch"):
+            front_door_style = "regular"
+        back_door_style_raw = result.get("back_door_style")
+        back_door_style = (back_door_style_raw or "regular").lower() if ea else None
+        if back_door_style and back_door_style not in ("regular", "dutch"):
+            back_door_style = "regular"
+
         logger.info(
             f"Extracted model from image: {model} | door_config={door_config} | "
-            f"front_doors={front_doors} | back_doors={back_doors} | ea={ea} | window={window}"
+            f"front_doors={front_doors} | back_doors={back_doors} | ea={ea} | window={window} | "
+            f"front_door_style={front_door_style} | back_door_style={back_door_style}"
         )
 
         config_summary = "EA (double both sides)" if ea else door_config.capitalize()
         window_summary = " + Window" if window else ""
+        door_style_summary = f" | Front door: {front_door_style.capitalize()}"
+        if ea:
+            door_style_summary += f" | Back door: {(back_door_style or 'regular').capitalize()}"
 
         await update.message.reply_text(
             f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
-            f"🚪 *Door config:* {config_summary}{window_summary}\n\n"
+            f"🚪 *Door config:* {config_summary}{window_summary}{door_style_summary}\n\n"
             f"Generating Checks Sheet PDF...",
             parse_mode="Markdown"
         )
@@ -781,6 +905,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "walls": walls,
                 "window": window,
                 "ea": ea,
+                "front_door_style": front_door_style,
+                "back_door_style": back_door_style,
                 "rows": rows,
             }
             await update.message.reply_text(
@@ -795,7 +921,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot=context.bot, chat_id=update.effective_chat.id,
             order_num=order_num, client_name=client_name, model=model, width=width,
             door_config=door_config, walls=walls, window=window, window_double=window_double,
-            ea=ea, rows=rows
+            ea=ea, front_door_style=front_door_style, back_door_style=back_door_style, rows=rows
         )
 
     except Exception as e:
@@ -1024,12 +1150,96 @@ EA_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("No", callback_data="ea_no")],
 ])
 
+# Стиль двери — Front (ручной ввод)
+DOOR_STYLE_FRONT_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Regular", callback_data="dstyle_front_regular")],
+    [InlineKeyboardButton("Dutch", callback_data="dstyle_front_dutch")],
+])
+
+# Стиль двери — Back (ручной ввод, только при EA)
+DOOR_STYLE_BACK_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Regular", callback_data="dstyle_back_regular")],
+    [InlineKeyboardButton("Dutch", callback_data="dstyle_back_dutch")],
+])
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start — показывает главное меню с 4 кнопками."""
     await update.message.reply_text(
         "👋 CBG Manager — main menu:",
         reply_markup=MAIN_MENU
     )
+
+
+async def _finalize_manual_entry(user_id, query, context):
+    """
+    Завершает ручной ввод (без PDF): собирает модель, тянет строки из LIST,
+    и либо спрашивает тип окна (Single/Double), либо сразу генерирует PDF.
+    Вызывается после того, как собраны все параметры, включая стиль(и) дверей.
+    """
+    entry = pending_manual_entry.pop(user_id)
+    ea = entry["ea"]
+    width = entry["width"]
+    length = entry["length"]
+    suffix = entry["suffix"]
+    window = entry["window"]
+    door_config = entry["door_config"]
+    walls = entry.get("walls", {})
+    order_num = entry["order_num"]
+    client_name = entry["client_name"]
+    front_door_style = entry.get("front_door_style", "regular")
+    back_door_style = entry.get("back_door_style") if ea else None
+    model = f"{width}x{length}{suffix}"
+
+    rows = get_list_rows_for_model(model)
+    if not rows:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"⚠️ Model *{model}* not found in LIST sheet.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Если Lintel Beam = Single и окно есть — нужно спросить тип окна (Single/Double)
+    if door_config == "single" and window:
+        pending_window_type[user_id] = {
+            "order_num": order_num,
+            "client_name": client_name,
+            "model": model,
+            "width": width,
+            "door_config": door_config,
+            "walls": walls,
+            "window": window,
+            "ea": ea,
+            "front_door_style": front_door_style,
+            "back_door_style": back_door_style,
+            "rows": rows,
+        }
+        await query.edit_message_text(
+            "Is the window single or double?",
+            reply_markup=WINDOW_TYPE_KEYBOARD
+        )
+        return
+
+    door_style_summary = f" | Front door: {front_door_style.capitalize()}"
+    if ea:
+        door_style_summary += f" | Back door: {(back_door_style or 'regular').capitalize()}"
+
+    await query.edit_message_text(
+        f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
+        f"🚪 *Door config:* {'EA (double both sides)' if ea else door_config.capitalize()}"
+        f"{' + Window' if window else ''}{door_style_summary}\n\n"
+        f"Generating Checks Sheet PDF...",
+        parse_mode="Markdown"
+    )
+
+    window_double = True if (window and door_config == "double") else False
+    await finalize_and_send(
+        bot=context.bot, chat_id=query.message.chat_id,
+        order_num=order_num, client_name=client_name, model=model, width=width,
+        door_config=door_config, walls=walls, window=window, window_double=window_double,
+        ea=ea, front_door_style=front_door_style, back_door_style=back_door_style, rows=rows
+    )
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия на все inline-кнопки."""
@@ -1175,61 +1385,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in ("ea_yes", "ea_no"):
         if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_ea":
             return
-        entry = pending_manual_entry.pop(user_id)
-        ea = (data == "ea_yes")
-        width = entry["width"]
-        length = entry["length"]
-        suffix = entry["suffix"]
-        window = entry["window"]
-        door_config = entry["door_config"]
-        walls = entry.get("walls", {})
-        order_num = entry["order_num"]
-        client_name = entry["client_name"]
-        model = f"{width}x{length}{suffix}"
-
-        rows = get_list_rows_for_model(model)
-        if not rows:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"⚠️ Model *{model}* not found in LIST sheet.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Если Lintel Beam = Single и окно есть — нужно спросить тип окна (Single/Double)
-        if door_config == "single" and window:
-            pending_window_type[user_id] = {
-                "order_num": order_num,
-                "client_name": client_name,
-                "model": model,
-                "width": width,
-                "door_config": door_config,
-                "walls": walls,
-                "window": window,
-                "ea": ea,
-                "rows": rows,
-            }
-            await query.edit_message_text(
-                "Is the window single or double?",
-                reply_markup=WINDOW_TYPE_KEYBOARD
-            )
-            return
-
+        entry = pending_manual_entry[user_id]
+        entry["ea"] = (data == "ea_yes")
+        entry["step"] = "await_front_style"
         await query.edit_message_text(
-            f"✅ *Order:* {order_num} | *Client:* {client_name} | *Model:* {model}\n"
-            f"🚪 *Door config:* {'EA (double both sides)' if ea else door_config.capitalize()}"
-            f"{' + Window' if window else ''}\n\n"
-            f"Generating Checks Sheet PDF...",
-            parse_mode="Markdown"
+            "Front door style — Regular or Dutch?",
+            reply_markup=DOOR_STYLE_FRONT_KEYBOARD
         )
 
-        window_double = True if (window and door_config == "double") else False
-        await finalize_and_send(
-            bot=context.bot, chat_id=query.message.chat_id,
-            order_num=order_num, client_name=client_name, model=model, width=width,
-            door_config=door_config, walls=walls, window=window, window_double=window_double,
-            ea=ea, rows=rows
-        )
+    elif data in ("dstyle_front_regular", "dstyle_front_dutch"):
+        if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_front_style":
+            return
+        entry = pending_manual_entry[user_id]
+        entry["front_door_style"] = "dutch" if data == "dstyle_front_dutch" else "regular"
+        if entry.get("ea"):
+            entry["step"] = "await_back_style"
+            await query.edit_message_text(
+                "Back door style — Regular or Dutch?",
+                reply_markup=DOOR_STYLE_BACK_KEYBOARD
+            )
+        else:
+            entry["back_door_style"] = None
+            await _finalize_manual_entry(user_id, query, context)
+
+    elif data in ("dstyle_back_regular", "dstyle_back_dutch"):
+        if user_id not in pending_manual_entry or pending_manual_entry[user_id].get("step") != "await_back_style":
+            return
+        entry = pending_manual_entry[user_id]
+        entry["back_door_style"] = "dutch" if data == "dstyle_back_dutch" else "regular"
+        await _finalize_manual_entry(user_id, query, context)
 
     elif data in ("wintype_single", "wintype_double"):
         if user_id not in pending_window_type:
@@ -1250,7 +1434,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot=context.bot, chat_id=query.message.chat_id,
             order_num=entry["order_num"], client_name=entry["client_name"], model=entry["model"],
             width=entry["width"], door_config=entry["door_config"], walls=entry["walls"],
-            window=entry["window"], window_double=window_double, ea=entry["ea"], rows=entry["rows"]
+            window=entry["window"], window_double=window_double, ea=entry["ea"],
+            front_door_style=entry.get("front_door_style", "regular"),
+            back_door_style=entry.get("back_door_style"),
+            rows=entry["rows"]
         )
 
 
