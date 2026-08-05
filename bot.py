@@ -757,12 +757,12 @@ def _double_quant(quant):
 
 def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool, window_double: bool = False) -> list:
     """
-    Применяет замены GW / EP / Lintel Beam / GBX / Gable Rafters / Gable Sills деталей
-    на основе конфигурации дверей.
+    Применяет замены GW / EP / Lintel Beam / GBX / Gable Rafters / Gable Sills / Drip Cap
+    деталей на основе конфигурации дверей.
 
     rows: список {"item":, "size_code":, "quant":} из LIST sheet
     width: ширина теплицы (8, 10, 12, 14) или None
-    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Rafters/Gable Sills)
+    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Rafters/Gable Sills/Drip Cap)
     ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет на GW/EP/Gable Center Sills
         И на Lintel Beam BACK (EA и окно взаимоисключающи — на практике вместе не встречаются)
     window: bool — есть окно (авто-определено по фото); влияет на Lintel Beam BACK / Gable Center Sills
@@ -775,6 +775,7 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
         code = row["size_code"]
         quant = row["quant"]
         code_clean = code.replace(" ", "").upper()
+        new_item = item
         new_code = code
         new_quant = quant
         skip = False
@@ -840,6 +841,17 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
                     new_code = "LB D-2"
                 # single, нет EA, нет окна — без изменений (остаётся LB S-2)
 
+        # ---- DRIP CAP — SGL → DBL при Lintel Beam Double ----
+        # Зависит ТОЛЬКО от door_config (как Front Lintel Beam) — EA и окно не влияют.
+        # Действует на все ширины (8/10/12/14). Меняются И item, И code, quant не меняется.
+        # Строка-источник в LIST: item "DRIP CAP SGL", code "SINGLE 43\"".
+        # Строка-цель: item "DRIP CAP DBL", code "DOUBLE 67\"".
+        elif item.strip().upper() == "DRIP CAP SGL":
+            if door_config == "double":
+                new_item = "DRIP CAP DBL"
+                new_code = 'DOUBLE 67"'
+            # single — без изменений (остаётся DRIP CAP SGL / SINGLE 43")
+
         # ---- EX Gable Batton (GBX) — модели шириной 12' / 14' ----
         # EA НЕ влияет на это правило — важен только ответ Single/Double.
         # На 8'/10' GBX всегда остаётся GBX-S (сюда не заходит).
@@ -887,6 +899,7 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
         if skip:
             continue
         new_row = dict(row)
+        new_row["item"] = new_item
         new_row["size_code"] = new_code
         new_row["quant"] = new_quant
         result.append(new_row)
