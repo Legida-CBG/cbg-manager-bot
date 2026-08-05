@@ -65,6 +65,25 @@ WINDOW_CODE_TABLE = {
 }
 
 
+# ─── ТАБЛИЦА MULLION CM ───────────────────────────────────────────────────────
+# Ключ: (door_config, width, back_wall_height) → базовый код (без окна).
+# Если EA=True — Mullion CM не добавляется вообще (см. get_mullion_cm_code / finalize_and_send).
+# Если window=True — к базовому коду добавляется суффикс "-W".
+# GG (высота задней стены) — варианта нет, строка не добавляется.
+MULLION_CM_TABLE = {
+    ("double", 14, "30"): "CM410",
+    ("double", 14, "18"): "CM510",
+    ("single", 12, "30"): "CM410",
+    ("single", 12, "18"): "CM510",
+    ("double", 12, "30"): "CM44",
+    ("double", 12, "18"): "CM54",
+    ("single", 10, "30"): "CM44",
+    ("single", 10, "18"): "CM54",
+    ("single", 8, "30"): "CM310",
+    ("single", 8, "18"): "CM410",
+}
+
+
 # ─── ТАБЛИЦА МАРКИРОВКИ ДВЕРЕЙ (REGULAR / DUTCH) ─────────────────────────────
 # Ключ: (door_config, width) — door_config это Single/Double Lintel Beam,
 # которое жёстко определяет число створок двери (10x8'/10' => single, 14' => double,
@@ -197,6 +216,67 @@ def get_window_code(width, door_config: str, back_wall_height, window_double: bo
         return entry
     single_code, double_code = entry
     return double_code if window_double else single_code
+
+
+def get_mullion_cm_code(width, door_config: str, back_wall_height, window: bool, ea: bool):
+    """
+    Возвращает код детали "MULLION CM" или None, если для данной комбинации
+    строка не нужна.
+
+    Правило:
+    - Если ea=True (двери с двух сторон) → MULLION CM отсутствует всегда → None
+    - Если back_wall_height == "GG" (нет в таблице) → None
+    - Базовый код берётся из MULLION_CM_TABLE по (door_config, width, back_wall_height)
+    - Если window=True → к базовому коду добавляется суффикс "-W"
+
+    width: 8, 10, 12 или 14 (int)
+    door_config: "single" или "double"
+    back_wall_height: "30", "18" или "GG"
+    window: bool — есть ли окно
+    ea: bool — двери с двух сторон
+    """
+    if ea:
+        return None
+    key = (door_config, width, back_wall_height)
+    base_code = MULLION_CM_TABLE.get(key)
+    if base_code is None:
+        return None
+    return f"{base_code}-W" if window else base_code
+
+
+def _insert_mullion_cm_row(rows: list, mullion_row: dict) -> list:
+    """
+    Вставляет строку MULLION CM между MULLION M (LEFT/RIGHT) и MULLION S (LEFT/RIGHT),
+    то есть сразу ПОСЛЕ последней найденной строки "MULLION M" и ПЕРЕД первой
+    строкой "MULLION S".
+
+    Если MULLION M не найден — вставляет перед первой строкой MULLION S.
+    Если и MULLION S не найден — вставляет перед первой строкой Ridge Beam
+    (запасной вариант), либо в конец списка.
+    """
+    insert_idx = None
+
+    for i, row in enumerate(rows):
+        if "MULLION M" in row["item"].upper():
+            insert_idx = i + 1  # после последней найденной строки MULLION M
+
+    if insert_idx is None:
+        for i, row in enumerate(rows):
+            if "MULLION S" in row["item"].upper():
+                insert_idx = i
+                break
+
+    if insert_idx is None:
+        for i, row in enumerate(rows):
+            if "RIDGE" in row["item"].upper():
+                insert_idx = i
+                break
+
+    if insert_idx is None:
+        insert_idx = len(rows)
+
+    rows.insert(insert_idx, mullion_row)
+    return rows
 
 
 def get_credentials():
@@ -403,7 +483,8 @@ async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, wi
     """
     Общая финальная функция: применяет замены дверной конфигурации, пересчитывает
     Lintel Posts, вставляет строки дверей (front всегда, back если EA), добавляет
-    строку DUTCH WINDOW PIECES (если окно есть) и отправляет PDF.
+    строку DUTCH WINDOW PIECES (если окно есть), добавляет строку MULLION CM
+    (если применимо) и отправляет PDF.
     """
     rows = apply_door_config_substitutions(rows, width, door_config, ea, window, window_double)
     rows = recalculate_lintel_posts(rows)
@@ -421,6 +502,11 @@ async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, wi
                 f"No window code found for width={width}, door_config={door_config}, "
                 f"back_wall={back_wall}, window_double={window_double}"
             )
+
+    back_wall = (walls or {}).get("back")
+    mullion_cm_code = get_mullion_cm_code(width, door_config, back_wall, window, ea)
+    if mullion_cm_code:
+        rows = _insert_mullion_cm_row(rows, {"item": "MULLION CM", "size_code": mullion_cm_code, "quant": "1"})
 
     pdf_bytes = generate_checks_pdf(order_num=order_num, client_name=client_name, model=model, rows=rows)
     filename = f"{order_num}_{client_name}_{model}_Checks.pdf"
