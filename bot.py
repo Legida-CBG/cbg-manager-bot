@@ -405,7 +405,7 @@ async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, wi
     Lintel Posts, вставляет строки дверей (front всегда, back если EA), добавляет
     строку DUTCH WINDOW PIECES (если окно есть) и отправляет PDF.
     """
-    rows = apply_door_config_substitutions(rows, width, door_config, ea, window)
+    rows = apply_door_config_substitutions(rows, width, door_config, ea, window, window_double)
     rows = recalculate_lintel_posts(rows)
 
     door_rows = build_door_rows(width, door_config, ea, front_door_style, back_door_style)
@@ -625,15 +625,18 @@ def _double_quant(quant):
         return quant
 
 
-def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool) -> list:
+def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool, window_double: bool = False) -> list:
     """
     Применяет замены GW / EP / Lintel Beam / GBX / Gable Sills деталей на основе конфигурации дверей.
 
     rows: список {"item":, "size_code":, "quant":} из LIST sheet
     width: ширина теплицы (8, 10, 12, 14) или None
     door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Sills)
-    ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет только на GW/EP/Gable Center Sills
-    window: bool — есть окно (авто-определено по фото); влияет только на Lintel Beam / Gable Center Sills
+    ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет на GW/EP/Gable Center Sills
+        И на Lintel Beam BACK (EA и окно взаимоисключающи — на практике вместе не встречаются)
+    window: bool — есть окно (авто-определено по фото); влияет на Lintel Beam BACK / Gable Center Sills
+    window_double: bool — окно одинарное (False) или двойное (True); используется только когда
+        door_config == "single" и window == True (при door_config == "double" окно всегда double)
     """
     result = []
     for row in rows:
@@ -680,25 +683,31 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
             elif door_config == "double":
                 new_code = _replace_code_prefix(code, "EP76", "EP70")
 
-        # ---- Lintel Beam — модели шириной 12' / 14' ----
-        elif width in (12, 14) and code_clean == "LBS-1":
+        # ---- Lintel Beam FRONT (база LB S-1) ----
+        # Front балка зависит ТОЛЬКО от door_config — ни EA, ни окно на неё не влияют.
+        elif code_clean == "LBS-1":
             if door_config == "double":
                 new_code = "LB D-1"
+            # single — без изменений (остаётся LB S-1)
 
-        elif width in (12, 14) and code_clean == "LBS-2":
-            if door_config == "double" and window:
-                new_code = "LB D-1N"
-            elif door_config == "double" and not window:
-                new_code = "LB D-2"
-            elif door_config == "single" and window:
-                new_code = "LB S-1N"
-            # single, без окна — без изменений
-
-        # ---- Lintel Beam — модели шириной 8' / 10' (нет Double-варианта) ----
-        elif width in (8, 10) and code_clean == "LBS-2":
-            if window:
-                new_code = "LB S-1N"
-            # LB S-1 на 8'/10' никогда не меняется
+        # ---- Lintel Beam BACK (база LB S-2) ----
+        # EA и окно на практике взаимоисключающи (никогда не встречаются в одном заказе),
+        # поэтому порядок проверки (сначала EA, потом window) не создаёт конфликтов.
+        # Ширина теплицы сама исключает невозможные комбинации:
+        #   - 14' всегда Double -> Single+EA для неё физически не бывает
+        #   - 8'/10' всегда Single -> Double+EA для неё физически не бывает
+        elif code_clean == "LBS-2":
+            if ea:
+                new_code = "LB D-1" if door_config == "double" else "LB S-1"
+            elif window:
+                if door_config == "double":
+                    new_code = "LB D-1N"
+                else:
+                    new_code = "LB S-1N" if window_double else "LB S-1"
+            else:
+                if door_config == "double":
+                    new_code = "LB D-2"
+                # single, нет EA, нет окна — без изменений (остаётся LB S-2)
 
         # ---- EX Gable Batton (GBX) — модели шириной 12' / 14' ----
         # EA НЕ влияет на это правило — важен только ответ Single/Double.
