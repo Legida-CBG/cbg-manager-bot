@@ -757,11 +757,12 @@ def _double_quant(quant):
 
 def apply_door_config_substitutions(rows: list, width, door_config: str, ea: bool, window: bool, window_double: bool = False) -> list:
     """
-    Применяет замены GW / EP / Lintel Beam / GBX / Gable Sills деталей на основе конфигурации дверей.
+    Применяет замены GW / EP / Lintel Beam / GBX / Gable Rafters / Gable Sills деталей
+    на основе конфигурации дверей.
 
     rows: список {"item":, "size_code":, "quant":} из LIST sheet
     width: ширина теплицы (8, 10, 12, 14) или None
-    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Sills)
+    door_config: "single" или "double" — ответ пользователя на кнопки (управляет GW/EP/Lintel Beam/GBX/Gable Rafters/Gable Sills)
     ea: bool — double с ОБЕИХ сторон (авто-определено по фото); влияет на GW/EP/Gable Center Sills
         И на Lintel Beam BACK (EA и окно взаимоисключающи — на практике вместе не встречаются)
     window: bool — есть окно (авто-определено по фото); влияет на Lintel Beam BACK / Gable Center Sills
@@ -846,6 +847,15 @@ def apply_door_config_substitutions(rows: list, width, door_config: str, ea: boo
             if door_config == "double":
                 new_code = _replace_code_prefix(code, "GBX-S", "GBX-T")
             # single — без изменений, остаётся GBX-S
+
+        # ---- Gable Rafters (GR) — все ширины ----
+        # В LIST количество указано для Single (буква "S" в коде, напр. GR12-LS / GR12-RS,
+        # либо с суффиксом X: GR10-LSX / GR10-RSX). При Double Lintel Beam буква "S" меняется
+        # на "D" (GR12-LS → GR12-LD, GR10-LSX → GR10-LDX), количество НЕ меняется.
+        # EA и окно на это правило не влияют.
+        elif code_clean.startswith("GR") and door_config == "double":
+            new_code = re.sub(r'-([LR])S', r'-\1D', code, flags=re.IGNORECASE)
+            # single — без изменений, буква "S" остаётся как в LIST
 
         # ---- Gable Corner Sills — только модели шириной 12' меняются ----
         # EA НЕ влияет на Corner Sills. На 8'/10'/14' код уже верный в LIST — не трогаем.
