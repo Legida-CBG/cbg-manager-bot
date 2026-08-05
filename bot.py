@@ -279,6 +279,49 @@ def _insert_mullion_cm_row(rows: list, mullion_row: dict) -> list:
     return rows
 
 
+def apply_wall_height_substitutions(rows: list, walls: dict) -> list:
+    """
+    Заменяет код Mullion M-1 → M-2 и Mullion S-1 → S-2 в зависимости от высоты
+    ЛЕВОЙ и ПРАВОЙ стены (front/back на это НЕ влияют).
+
+    Правило:
+    - "MULLION M LEFT"  + код "M-1" + левая стена  == "18" → код становится "M-2"
+    - "MULLION M RIGHT" + код "M-1" + правая стена == "18" → код становится "M-2"
+    - "MULLION S LEFT"  + код "S-1" + левая стена  == "18" → код становится "S-2"
+    - "MULLION S RIGHT" + код "S-1" + правая стена == "18" → код становится "S-2"
+    - Высота стены "30" → без изменений (остаётся M-1 / S-1)
+    - Высота стены "GG" → пока без изменений (правило будет определено позже)
+    - Ширина теплицы, door_config и EA на это правило не влияют
+    - Количество (quant) не меняется, меняется только код
+
+    rows: список {"item":, "size_code":, "quant":} из LIST sheet
+    walls: {"front":, "back":, "right":, "left":} — высоты стен ("30"/"18"/"GG")
+    """
+    left_height = (walls or {}).get("left")
+    right_height = (walls or {}).get("right")
+
+    result = []
+    for row in rows:
+        item_upper = row["item"].strip().upper()
+        code_clean = row["size_code"].replace(" ", "").upper()
+        new_code = row["size_code"]
+
+        if item_upper == "MULLION M LEFT" and code_clean == "M-1" and left_height == "18":
+            new_code = "M-2"
+        elif item_upper == "MULLION M RIGHT" and code_clean == "M-1" and right_height == "18":
+            new_code = "M-2"
+        elif item_upper == "MULLION S LEFT" and code_clean == "S-1" and left_height == "18":
+            new_code = "S-2"
+        elif item_upper == "MULLION S RIGHT" and code_clean == "S-1" and right_height == "18":
+            new_code = "S-2"
+
+        new_row = dict(row)
+        new_row["size_code"] = new_code
+        result.append(new_row)
+
+    return result
+
+
 def get_credentials():
     creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
     creds_dict = json.loads(creds_json)
@@ -481,12 +524,13 @@ async def finalize_and_send(bot: Bot, chat_id, order_num, client_name, model, wi
                              door_config, walls, window, window_double, ea,
                              front_door_style, back_door_style, rows):
     """
-    Общая финальная функция: применяет замены дверной конфигурации, пересчитывает
-    Lintel Posts, вставляет строки дверей (front всегда, back если EA), добавляет
-    строку DUTCH WINDOW PIECES (если окно есть), добавляет строку MULLION CM
-    (если применимо) и отправляет PDF.
+    Общая финальная функция: применяет замены дверной конфигурации, замены по
+    высоте стен (Mullion M/S), пересчитывает Lintel Posts, вставляет строки
+    дверей (front всегда, back если EA), добавляет строку DUTCH WINDOW PIECES
+    (если окно есть), добавляет строку MULLION CM (если применимо) и отправляет PDF.
     """
     rows = apply_door_config_substitutions(rows, width, door_config, ea, window, window_double)
+    rows = apply_wall_height_substitutions(rows, walls)
     rows = recalculate_lintel_posts(rows)
 
     door_rows = build_door_rows(width, door_config, ea, front_door_style, back_door_style)
